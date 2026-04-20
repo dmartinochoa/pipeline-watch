@@ -11,27 +11,28 @@ repo root. No network calls.
 """
 from __future__ import annotations
 
-import json
-import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
 from pipeline_watch import __version__
-from pipeline_watch.baseline.store import PackageSnapshot, Store
+from pipeline_watch.baseline.store import PackageSnapshot
 from pipeline_watch.detectors.supply_chain import (
     ManifestEntry,
     signal_constraint_loosened,
     signal_cross_ecosystem,
+    signal_dormant_revival,
     signal_install_script_change,
+    signal_maintainer_removed,
     signal_new_maintainer,
     signal_new_transitive_dep,
     signal_off_hours_release,
     signal_release_without_tag,
     signal_typosquat,
+    signal_version_downgrade,
+    signal_yanked_or_deprecated,
 )
 from pipeline_watch.output.formatter import report_json
 from pipeline_watch.providers.npm import NpmPackageInfo
-
 
 NOW = datetime(2026, 4, 20, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -44,17 +45,21 @@ def main() -> None:
         has_install_script=True, install_script_hash="a" * 64,
         dependencies={"urllib3": ">=1.21.1"},
         recorded_at="2026-04-19T12:00:00+00:00",
+        manifest_constraint="==2.31.0",
+        release_uploaded_at="2023-05-22T14:30:00+00:00",
     )
     current = PackageSnapshot(
         ecosystem="pypi", package="requests", version="2.32.0",
         maintainers=[
-            {"name": "alice", "email": "a@example.com", "first_seen": ""},
             {"name": "mallory", "email": "m@bad.example", "first_seen": ""},
         ],
         release_hour=3, release_weekday=5,
         has_install_script=True, install_script_hash="b" * 64,
         dependencies={"urllib3": ">=1.21.1", "evilmod": "==1.0"},
         recorded_at=NOW.isoformat(),
+        manifest_constraint=">=2.31",
+        release_uploaded_at=NOW.isoformat(),
+        yanked=True,
     )
     findings = []
     findings += signal_new_maintainer(
@@ -79,12 +84,32 @@ def main() -> None:
     ])
     findings += signal_cross_ecosystem(
         ManifestEntry(name="requests", constraint="", source_line="requests"),
+        ecosystem="pypi",
         npm_probe=lambda _n: NpmPackageInfo(
             name="requests",
             created_iso=(NOW.replace(day=10)).isoformat(),
         ),
+        pypi_probe=None,
         now=NOW,
     )
+    findings += signal_maintainer_removed(prev, current)
+    # Downgrade example uses a separate pair so the rest of the example
+    # stays as a forward-moving 2.31.0 → 2.32.0 release.
+    downgrade_prev = PackageSnapshot(
+        ecosystem="pypi", package="colors", version="1.4.2",
+        maintainers=[{"name": "marak"}],
+        recorded_at="2026-03-01T00:00:00+00:00",
+        release_uploaded_at="2022-01-01T03:00:00+00:00",
+    )
+    downgrade_current = PackageSnapshot(
+        ecosystem="pypi", package="colors", version="1.4.1",
+        maintainers=[{"name": "marak"}],
+        recorded_at=NOW.isoformat(),
+        release_uploaded_at=NOW.isoformat(),
+    )
+    findings += signal_version_downgrade(downgrade_prev, downgrade_current)
+    findings += signal_dormant_revival(downgrade_prev, current)
+    findings += signal_yanked_or_deprecated(current)
 
     # Stamp every finding's timestamp to NOW so the example stays
     # reproducible across runs.

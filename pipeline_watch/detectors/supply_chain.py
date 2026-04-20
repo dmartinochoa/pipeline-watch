@@ -1,31 +1,17 @@
 """Supply-chain behavioural detector.
 
 Emits a :class:`~pipeline_watch.output.schema.Finding` for each of the
-eight signals documented in the README, comparing the live state of a
-PyPI manifest's packages against the prior snapshot in the baseline
-store.
+twelve signals documented in the README, comparing the live state of a
+package manifest (PyPI or npm) against the prior snapshot in the
+baseline store.
 
-Design
-------
-Signals are small top-level functions that take two snapshots (``prev``
-and ``current``) plus whatever auxiliary data they need (GitHub client,
-sibling package names for typosquat) and return zero or more
-``Finding`` objects. The top-level :func:`scan` drives the pipeline:
+Each signal is a pure function over a pair of snapshots (plus any
+extra context it needs — GitHub probes, release history, sibling
+names). The top-level :func:`scan` drives the loop, records new
+snapshots, and refreshes the precomputed stats.
 
-    for entry in manifest:
-        current = fetch + snapshot from pypi
-        prev    = store.latest_snapshot(...)
-        findings += signal_new_maintainer(prev, current, github_probe)
-        findings += signal_off_hours_release(prev, current, stats)
-        ...
-        store.record_snapshot(current)
-    store_stats_refresh()
-
-Two-pass typosquat / cross-ecosystem signals run over the full
-manifest after the per-package loop so pairwise work happens once.
-
-All network calls flow through the providers package's fetcher hooks,
-so tests can run end-to-end without touching the real network.
+All network calls flow through the providers' swappable fetchers, so
+tests run end-to-end without touching the real network.
 """
 from __future__ import annotations
 
@@ -34,6 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import Levenshtein
 
@@ -54,6 +41,10 @@ SIGNAL_IDS = {
     "SC-006": "version-constraint-loosened",
     "SC-007": "typosquat-distance",
     "SC-008": "cross-ecosystem-new-registration",
+    "SC-009": "maintainer-removed",
+    "SC-010": "version-downgrade",
+    "SC-011": "dormant-package-revival",
+    "SC-012": "release-yanked-or-deprecated",
 }
 
 
@@ -78,11 +69,11 @@ _MANIFEST_LINE_RE = re.compile(
 def parse_requirements_txt(path: str | Path) -> list[ManifestEntry]:
     """Parse a ``requirements.txt`` into manifest entries.
 
-    Intentionally simple: one package per non-comment line, first
-    ``op + version`` captured as the constraint. We skip pip-only
-    directives (``-r``, ``-e``, ``--find-links``) because those
-    aren't packages to baseline. A malformed line is skipped with
-    no error — baselining is a best-effort observation.
+    One package per non-comment line, first ``op + version`` captured
+    as the constraint. Pip-only directives (``-r``, ``-e``,
+    ``--find-links``) are skipped because those aren't packages to
+    baseline. Malformed lines are skipped silently — baselining is
+    best-effort observation.
     """
     entries: list[ManifestEntry] = []
     text = Path(path).read_text(encoding="utf-8")
@@ -103,11 +94,31 @@ def parse_requirements_txt(path: str | Path) -> list[ManifestEntry]:
     return entries
 
 
+def parse_package_json(path: str | Path) -> list[ManifestEntry]:
+    """Parse a ``package.json`` into manifest entries (npm ecosystem)."""
+    npm_entries = _npm.parse_package_json(path)
+    return [
+        ManifestEntry(name=e.name, constraint=e.constraint, source_line=e.source_line)
+        for e in npm_entries
+    ]
+
+
+def parse_manifest(path: str | Path, ecosystem: str) -> list[ManifestEntry]:
+    """Dispatch to the right parser based on *ecosystem*."""
+    eco = ecosystem.lower()
+    if eco == "pypi":
+        return parse_requirements_txt(path)
+    if eco == "npm":
+        return parse_package_json(path)
+    raise ValueError(f"unsupported ecosystem: {ecosystem!r}")
+
+
 # ── Signal functions ────────────────────────────────────────────────
 
 
 GitHubProbe = Callable[[str, str], tuple[bool, list[str]]]  # (has_commits, tags)
 NpmProbe = Callable[[str], _npm.NpmPackageInfo | None]
+PyPIProbe = Callable[[str], Any]  # returns PyPI package info or None
 
 
 def signal_new_maintainer(
@@ -127,9 +138,6 @@ def signal_new_maintainer(
     ]
     if not new_names:
         return []
-    # Use the GitHub probe (if available) to confirm "no commit history".
-    # Without a probe we emit MEDIUM instead of HIGH — a new maintainer
-    # is still a signal, just lower-confidence.
     findings: list[Finding] = []
     for new_m in new_names:
         has_commits = None
@@ -141,7 +149,6 @@ def signal_new_maintainer(
                 except _github.GitHubError:
                     has_commits = None
                 if has_commits:
-                    # Legitimate maintainer — do not flag.
                     continue
         severity = Severity.HIGH if has_commits is False else Severity.MEDIUM
         findings.append(Finding(
@@ -178,12 +185,7 @@ def signal_off_hours_release(
     prev_hours: list[int],
     current: PackageSnapshot,
 ) -> list[Finding]:
-    """SC-002: release hour falls outside the historical 90% window.
-
-    Needs at least three prior observations — two samples degenerate
-    into "every hour is an outlier". Three is the smallest sample
-    that yields a meaningful quantile.
-    """
+    """SC-002: release hour falls outside the historical 90% window."""
     if current.release_hour is None or len(prev_hours) < 3:
         return []
     from ..baseline.stats import percentile_window
@@ -242,14 +244,12 @@ def signal_release_without_tag(
         return []
     if not tags:
         return []
-    # Accept both ``v1.2.3`` and ``1.2.3`` styles — and a prefixed
-    # package name form (``requests-1.2.3``) that some multi-package
-    # repos use.
     candidates = {
         current.version,
         f"v{current.version}",
         f"{current.package}-{current.version}",
         f"{current.package}/{current.version}",
+        f"release-{current.version}",
     }
     tag_set = set(tags)
     if candidates & tag_set:
@@ -259,7 +259,7 @@ def signal_release_without_tag(
         module=Module.SUPPLY_CHAIN,
         severity=Severity.HIGH,
         signal=(
-            f"{current.package} {current.version} was published to PyPI but "
+            f"{current.package} {current.version} was published but "
             f"no matching tag exists in {source_repo}."
         ),
         baseline=(
@@ -275,7 +275,7 @@ def signal_release_without_tag(
         remediation=(
             "Publishing without tagging is the signature of a compromised "
             "registry credential. Pin away from this version, open an "
-            "issue upstream, and preserve the sdist for incident response."
+            "issue upstream, and preserve the artifact for incident response."
         ),
         timestamp=current.recorded_at,
     )]
@@ -288,15 +288,12 @@ def signal_install_script_change(
     """SC-004: install-script hooks appeared or their hash changed."""
     if prev is None:
         return []
-    # Case A: a hook appeared where none existed.
     if not prev.has_install_script and current.has_install_script:
         severity = Severity.HIGH
         signal = (
             f"{current.package} {current.version} added an install-script "
-            f"hook (setup.py / __init__.py / pyproject.toml) where the "
-            f"previous snapshot had none."
+            f"hook where the previous snapshot had none."
         )
-    # Case B: the hash changed between releases.
     elif (
         prev.has_install_script
         and current.has_install_script
@@ -329,9 +326,9 @@ def signal_install_script_change(
             "current_hash": current.install_script_hash,
         },
         remediation=(
-            "Review the diff of setup.py / __init__.py between the two "
-            "sdists. Install-script additions are the signature of the "
-            "event-stream and ctx-typosquat compromises."
+            "Diff setup.py / __init__.py / package.json scripts between "
+            "the two releases. Install-hook changes are the signature of "
+            "the event-stream and ctx typosquat compromises."
         ),
         timestamp=current.recorded_at,
     )]
@@ -368,8 +365,8 @@ def signal_new_transitive_dep(
         },
         remediation=(
             "A new transitive dependency is not automatically malicious, "
-            "but verify the release notes explain it. Run this package "
-            "through pipeline-check against the new dep's source tree."
+            "but verify the release notes explain it. Run pipeline-check "
+            "against the new dep's source tree."
         ),
         timestamp=current.recorded_at,
     )]
@@ -379,14 +376,11 @@ def signal_constraint_loosened(
     prev_entry_constraint: str,
     current_entry: ManifestEntry,
 ) -> list[Finding]:
-    """SC-006: manifest constraint went from ``==`` to ``>=`` / unpinned."""
-    # We compare the *manifest* constraint, not the package's runtime deps,
-    # because SC-006 is about how the consuming repo pins its dependencies.
-    prev_c = prev_entry_constraint.strip()
+    """SC-006: manifest constraint relaxed from pinned (``==``) to floating."""
+    prev_c = (prev_entry_constraint or "").strip()
     cur_c = current_entry.constraint.strip()
     if not prev_c.startswith("==") or cur_c.startswith("=="):
         return []
-    # Exact-pin dropped — either unpinned entirely or loosened to a range.
     return [Finding(
         check_id="SC-006",
         module=Module.SUPPLY_CHAIN,
@@ -409,11 +403,7 @@ def signal_constraint_loosened(
 
 
 def signal_typosquat(entries: list[ManifestEntry]) -> list[Finding]:
-    """SC-007: pair of manifest packages whose names are ≤2 edit distance apart.
-
-    Flags the *pair* — the detector can't know which side is legitimate,
-    and the operator needs both names to investigate.
-    """
+    """SC-007: pair of manifest packages whose names are ≤2 edit distance apart."""
     findings: list[Finding] = []
     names = [e.name.lower() for e in entries]
     n = len(names)
@@ -453,26 +443,51 @@ def signal_typosquat(entries: list[ManifestEntry]) -> list[Finding]:
 def signal_cross_ecosystem(
     entry: ManifestEntry,
     *,
+    ecosystem: str,
     npm_probe: NpmProbe | None,
+    pypi_probe: PyPIProbe | None,
     now: datetime,
     window_days: int = 30,
 ) -> list[Finding]:
     """SC-008: same package name newly registered on the other ecosystem.
 
-    Only npm → PyPI cross-check is implemented in Module 1 (the PyPI
-    manifest is the input). The reverse direction arrives with the npm
-    manifest parser.
+    Bidirectional: a PyPI manifest cross-checks against npm; an npm
+    manifest cross-checks against PyPI. In both directions, a fresh
+    cross-registration within *window_days* is the dependency-confusion
+    signature.
     """
-    if npm_probe is None:
+    other = "npm" if ecosystem == "pypi" else "pypi"
+    created_iso = ""
+    source_url = ""
+    if other == "npm" and npm_probe is not None:
+        try:
+            info = npm_probe(entry.name)
+        except _npm.NpmError:
+            return []
+        if info is None or not info.created_iso:
+            return []
+        created_iso = info.created_iso
+        source_url = f"https://www.npmjs.com/package/{entry.name}"
+    elif other == "pypi" and pypi_probe is not None:
+        try:
+            pkg = pypi_probe(entry.name)
+        except _pypi.PyPIError:
+            return []
+        if pkg is None or not pkg.releases:
+            return []
+        # Earliest PyPI upload across all releases == first registration.
+        times = sorted(
+            [r.upload_time_iso for r in pkg.releases if r.upload_time_iso]
+        )
+        if not times:
+            return []
+        created_iso = times[0]
+        source_url = f"https://pypi.org/project/{entry.name}/"
+    else:
         return []
+
     try:
-        info = npm_probe(entry.name)
-    except _npm.NpmError:
-        return []
-    if info is None or not info.created_iso:
-        return []
-    try:
-        created = datetime.fromisoformat(info.created_iso.replace("Z", "+00:00"))
+        created = datetime.fromisoformat(created_iso.replace("Z", "+00:00"))
     except ValueError:
         return []
     if (now - created) > timedelta(days=window_days):
@@ -482,9 +497,9 @@ def signal_cross_ecosystem(
         module=Module.SUPPLY_CHAIN,
         severity=Severity.MEDIUM,
         signal=(
-            f"A package named '{entry.name}' was registered on npm "
-            f"{(now - created).days} day(s) ago — matching a PyPI name "
-            f"in your manifest."
+            f"A package named '{entry.name}' was registered on {other} "
+            f"{(now - created).days} day(s) ago — matching a {ecosystem} "
+            f"name in your manifest."
         ),
         baseline=(
             f"Cross-ecosystem collisions registered within the last "
@@ -492,14 +507,180 @@ def signal_cross_ecosystem(
         ),
         evidence={
             "package": entry.name,
-            "npm_registered": info.created_iso,
+            "manifest_ecosystem": ecosystem,
+            "registered_ecosystem": other,
+            "registration_iso": created_iso,
+            "source_url": source_url,
             "window_days": window_days,
         },
         remediation=(
             "Register the same name defensively on the other ecosystem, "
-            "or add a resolver pin to prevent a package-manager lookup "
-            "from silently switching ecosystems."
+            "or add a resolver pin so a package-manager lookup can't "
+            "silently switch ecosystems."
         ),
+    )]
+
+
+def signal_maintainer_removed(
+    prev: PackageSnapshot | None,
+    current: PackageSnapshot,
+) -> list[Finding]:
+    """SC-009: every previously known maintainer has disappeared.
+
+    A wholesale maintainer swap — with no overlap — is the signature
+    of a hostile takeover (npm account handover, abandoned-pkg hijack).
+    We intentionally only fire when ``prev`` had maintainers *and*
+    none of them remain in ``current``; losing one of many is common
+    and handled by operator review.
+    """
+    if prev is None or not prev.maintainers or not current.maintainers:
+        return []
+    prev_names = {m.get("name", "").lower() for m in prev.maintainers if m.get("name")}
+    curr_names = {m.get("name", "").lower() for m in current.maintainers if m.get("name")}
+    if not prev_names or not curr_names:
+        return []
+    if prev_names & curr_names:
+        return []
+    return [Finding(
+        check_id="SC-009",
+        module=Module.SUPPLY_CHAIN,
+        severity=Severity.HIGH,
+        signal=(
+            f"{current.package} maintainer list completely replaced — no "
+            f"previously known maintainer remains."
+        ),
+        baseline=(
+            f"Previous maintainers: {', '.join(sorted(prev_names))}. "
+            f"Current maintainers: {', '.join(sorted(curr_names))}."
+        ),
+        evidence={
+            "package": current.package,
+            "previous_maintainers": sorted(prev_names),
+            "current_maintainers": sorted(curr_names),
+        },
+        remediation=(
+            "Freeze the dependency immediately. A total ownership swap is "
+            "the fingerprint of a hijacked account or abandoned-package "
+            "takeover (ua-parser-js, event-stream)."
+        ),
+        timestamp=current.recorded_at,
+    )]
+
+
+def signal_version_downgrade(
+    prev: PackageSnapshot | None,
+    current: PackageSnapshot,
+) -> list[Finding]:
+    """SC-010: the registry's latest version is *older* than what we saw before.
+
+    An attacker with publish rights can unpublish/yank the real latest
+    and push an older-looking version that installers prefer. A drop in
+    the ordered release tuple is always worth investigating.
+    """
+    if prev is None or not prev.version or not current.version:
+        return []
+    if _version_tuple(current.version) >= _version_tuple(prev.version):
+        return []
+    return [Finding(
+        check_id="SC-010",
+        module=Module.SUPPLY_CHAIN,
+        severity=Severity.HIGH,
+        signal=(
+            f"{current.package}'s advertised latest dropped from "
+            f"{prev.version} to {current.version}."
+        ),
+        baseline=f"Prior recorded version: {prev.version}.",
+        evidence={
+            "package": current.package,
+            "previous_version": prev.version,
+            "current_version": current.version,
+        },
+        remediation=(
+            "Pin the last known-good version and investigate whether the "
+            "registry account published a rollback or whether the newer "
+            "release was unpublished."
+        ),
+        timestamp=current.recorded_at,
+    )]
+
+
+def signal_dormant_revival(
+    prev: PackageSnapshot | None,
+    current: PackageSnapshot,
+    *,
+    dormant_days: int = 365,
+) -> list[Finding]:
+    """SC-011: a release after a long silence — the classic revival-attack shape."""
+    if prev is None or not prev.release_uploaded_at or not current.release_uploaded_at:
+        return []
+    prev_dt = _parse_iso(prev.release_uploaded_at)
+    cur_dt = _parse_iso(current.release_uploaded_at)
+    if prev_dt is None or cur_dt is None:
+        return []
+    gap = cur_dt - prev_dt
+    if gap < timedelta(days=dormant_days):
+        return []
+    return [Finding(
+        check_id="SC-011",
+        module=Module.SUPPLY_CHAIN,
+        severity=Severity.MEDIUM,
+        signal=(
+            f"{current.package} {current.version} was published "
+            f"{gap.days} days after {prev.version} — a long dormant period "
+            f"followed by a sudden release."
+        ),
+        baseline=(
+            f"Previous release {prev.version} was uploaded "
+            f"{prev.release_uploaded_at}."
+        ),
+        evidence={
+            "package": current.package,
+            "previous_version": prev.version,
+            "previous_uploaded_at": prev.release_uploaded_at,
+            "current_version": current.version,
+            "current_uploaded_at": current.release_uploaded_at,
+            "dormant_days": gap.days,
+            "threshold_days": dormant_days,
+        },
+        remediation=(
+            "Dormant packages that suddenly republish are a prized target "
+            "for attackers. Confirm the maintainer announced the revival "
+            "before trusting the new release."
+        ),
+        timestamp=current.recorded_at,
+    )]
+
+
+def signal_yanked_or_deprecated(
+    current: PackageSnapshot,
+) -> list[Finding]:
+    """SC-012: the advertised latest release is yanked (PyPI) or deprecated (npm)."""
+    if not current.yanked:
+        return []
+    ecosystem_label = "yanked" if current.ecosystem == "pypi" else "deprecated"
+    return [Finding(
+        check_id="SC-012",
+        module=Module.SUPPLY_CHAIN,
+        severity=Severity.HIGH,
+        signal=(
+            f"{current.package} {current.version} is currently marked "
+            f"{ecosystem_label} on {current.ecosystem}."
+        ),
+        baseline=(
+            f"A {ecosystem_label} release means the maintainer (or the "
+            f"registry) has withdrawn the artefact from normal use."
+        ),
+        evidence={
+            "package": current.package,
+            "version": current.version,
+            "ecosystem": current.ecosystem,
+        },
+        remediation=(
+            "Pin off this version. Yanked/deprecated releases are either "
+            "broken or actively harmful — installers will still resolve "
+            "them unless you pin away."
+        ),
+        timestamp=current.recorded_at,
     )]
 
 
@@ -517,8 +698,10 @@ def scan(
     store: Store,
     entries: list[ManifestEntry],
     *,
+    ecosystem: str = "pypi",
     github_probe: GitHubProbe | None = None,
     npm_probe: NpmProbe | None = None,
+    pypi_probe: PyPIProbe | None = None,
     mode: str = "scan",
     now: datetime | None = None,
 ) -> ScanResult:
@@ -531,6 +714,8 @@ def scan(
     """
     if mode not in ("scan", "init"):
         raise ValueError(f"mode must be 'scan' or 'init', got {mode!r}")
+    if ecosystem not in ("pypi", "npm"):
+        raise ValueError(f"ecosystem must be 'pypi' or 'npm', got {ecosystem!r}")
     now = now or datetime.now(timezone.utc)
     now_iso = now.isoformat()
 
@@ -538,25 +723,18 @@ def scan(
     snapshots_recorded = 0
     missing: list[str] = []
 
-    # Remember the prior constraint per package so SC-006 can diff the
-    # manifest even though the store only holds package snapshots.
-    prior_constraints: dict[str, str] = {}
-    for eco, pkg in store.all_packages("pypi"):
-        snap = store.latest_snapshot(eco, pkg)
-        if snap:
-            prior_constraints[pkg] = ""  # placeholder — constraint comes from the manifest side
-
     for entry in entries:
-        pkg_info = _pypi.fetch_package(entry.name, include_install_script_hash=True)
-        if pkg_info is None:
+        pkg_info, current = _fetch_current_snapshot(
+            ecosystem, entry, now_iso=now_iso,
+        )
+        if current is None:
             missing.append(entry.name)
             continue
-        current = _pypi.snapshot_from_package(pkg_info, recorded_at=now_iso)
-        prev = store.latest_snapshot("pypi", entry.name)
-        prev_hours = store.release_hours("pypi", entry.name)
+        prev = store.latest_snapshot(ecosystem, entry.name)
+        prev_hours = store.release_hours(ecosystem, entry.name)
 
         if mode == "scan":
-            source_repo = pkg_info.source_repo()
+            source_repo = _source_repo(pkg_info)
             findings += signal_new_maintainer(
                 prev, current,
                 github_probe=github_probe, source_repo=source_repo,
@@ -568,19 +746,25 @@ def scan(
             )
             findings += signal_install_script_change(prev, current)
             findings += signal_new_transitive_dep(prev, current)
-            if entry.name in prior_constraints:
+            findings += signal_maintainer_removed(prev, current)
+            findings += signal_version_downgrade(prev, current)
+            findings += signal_dormant_revival(prev, current)
+            findings += signal_yanked_or_deprecated(current)
+            if prev is not None:
                 findings += signal_constraint_loosened(
-                    prior_constraints[entry.name], entry,
+                    prev.manifest_constraint or "", entry,
                 )
             findings += signal_cross_ecosystem(
-                entry, npm_probe=npm_probe, now=now,
+                entry,
+                ecosystem=ecosystem,
+                npm_probe=npm_probe, pypi_probe=pypi_probe,
+                now=now,
             )
 
         store.record_snapshot(current)
         snapshots_recorded += 1
 
     if mode == "scan":
-        # Typosquat is a pairwise signal — run once over the manifest.
         findings += signal_typosquat(entries)
 
     refresh_package_hour_stats(store, now=now)
@@ -589,3 +773,69 @@ def scan(
         snapshots_recorded=snapshots_recorded,
         packages_missing_from_registry=missing,
     )
+
+
+# ── Internal helpers ────────────────────────────────────────────────
+
+
+def _fetch_current_snapshot(
+    ecosystem: str,
+    entry: ManifestEntry,
+    *,
+    now_iso: str,
+) -> tuple[Any, PackageSnapshot | None]:
+    if ecosystem == "pypi":
+        pkg = _pypi.fetch_package(entry.name, include_install_script_hash=True)
+        if pkg is None:
+            return None, None
+        snap = _pypi.snapshot_from_package(
+            pkg, recorded_at=now_iso, manifest_constraint=entry.constraint,
+        )
+        return pkg, snap
+    if ecosystem == "npm":
+        pkg = _npm.fetch_package(entry.name)
+        if pkg is None:
+            return None, None
+        snap = _npm.snapshot_from_package(
+            pkg, recorded_at=now_iso, manifest_constraint=entry.constraint,
+        )
+        return pkg, snap
+    raise ValueError(f"unsupported ecosystem: {ecosystem!r}")
+
+
+def _source_repo(pkg_info: Any) -> str | None:
+    if pkg_info is None:
+        return None
+    getter = getattr(pkg_info, "source_repo", None)
+    return getter() if callable(getter) else None
+
+
+_VERSION_COMPONENT_RE = re.compile(r"^(\d+)(.*)$")
+
+
+def _version_tuple(v: str) -> tuple:
+    """Loose ordering for PEP 440 / semver-ish version strings.
+
+    Not a full parser — we only need to detect a *drop*. Non-numeric
+    tails sort after numeric components for the same position so
+    ``1.0.0`` > ``1.0.0rc1``. Unparseable components fall back to
+    string comparison, which is good enough to notice rollbacks.
+    """
+    parts = re.split(r"[.\-+]", v.strip())
+    tupled: list[tuple[int, int, str]] = []
+    for p in parts:
+        m = _VERSION_COMPONENT_RE.match(p)
+        if m:
+            tupled.append((0, int(m.group(1)), m.group(2) or ""))
+        else:
+            tupled.append((1, 0, p))
+    return tuple(tupled)
+
+
+def _parse_iso(s: str) -> datetime | None:
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None

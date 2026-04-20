@@ -1,23 +1,24 @@
 """CLI entry point.
 
-Usage
------
-    pipeline_watch baseline init --manifest requirements.txt --ecosystem pypi
-    pipeline_watch baseline show --package requests
-    pipeline_watch baseline reset --scope package:requests
+Commands
+--------
+    pipeline_watch baseline init   --manifest PATH --ecosystem {pypi|npm}
+    pipeline_watch baseline show   [--package NAME] [--ecosystem ...]
+    pipeline_watch baseline reset  --scope {package:NAME|job:REPO:JOB|org:NAME}
     pipeline_watch baseline stats
 
-    pipeline_watch scan deps --manifest requirements.txt --ecosystem pypi
-    pipeline_watch scan all --manifest requirements.txt --output findings.json
+    pipeline_watch scan deps       --manifest PATH --ecosystem {pypi|npm}
+    pipeline_watch scan all        --manifest PATH [--ecosystem ...]
 
 Exit codes
 ----------
-    0   No HIGH or CRITICAL findings (gate passes)
-    1   Gate failed — at least one HIGH or CRITICAL finding
-    2   Scanner failure (e.g. registry API error)
+    0   No finding at or above ``--fail-on`` severity (default HIGH) — gate passes
+    1   Gate failed — at least one finding at or above that severity
+    2   Scanner failure (registry API error, malformed manifest, etc.)
+    3   Baseline lookup had nothing to return
 
-The gate threshold mirrors pipeline-check: any ``D`` grade fails, so
-the two tools can share one CI step.
+The gate threshold mirrors pipeline-check so the two tools can share a
+single CI step.
 """
 from __future__ import annotations
 
@@ -37,6 +38,7 @@ from .output.formatter import report_json, report_terminal
 from .output.schema import Severity, score_from_findings
 from .providers import github as _github
 from .providers import npm as _npm
+from .providers import pypi as _pypi
 
 
 def _tolerate_unencodable_stdio() -> None:
@@ -69,16 +71,13 @@ def _resolve_baseline_path(explicit: str | None) -> Path:
 def _github_probe_factory(enable: bool):
     """Return a probe callable, or None if disabled.
 
-    Wrapped so the detector doesn't need to know about the module-level
-    fetcher — the probe signature is ``(owner, repo) -> (has_commits, tags)``.
+    Signature: ``(owner, repo) -> (has_commits, tags)``. The detector
+    passes owner/repo; we answer tags unconditionally and leave the
+    ``has_commits`` dimension to the detector's separate lookup.
     """
     if not enable:
         return None
     def probe(owner: str, repo: str) -> tuple[bool, list[str]]:
-        # user_has_commits needs an author; we only use the tag list
-        # for SC-003 and fall back to has_commits=False for SC-001
-        # when the probe itself can't answer (the detector passes a
-        # specific username via its own code path if available).
         tags = _github.list_tags(owner, repo)
         return False, tags
     return probe
@@ -92,18 +91,13 @@ def _npm_probe_factory(enable: bool):
     return probe
 
 
-def _pair_github_probe(username_map: dict[str, str] | None):
-    """Return a probe that uses the real GitHub client for commit history.
-
-    Wraps both SC-001's "has_commits" lookup and SC-003's tag list into
-    a single callable, so the detector's GitHubProbe signature stays
-    stable.
-    """
-    def probe(owner: str, repo: str) -> tuple[bool, list[str]]:
-        user = (username_map or {}).get(f"{owner}/{repo}", "")
-        has = _github.user_has_commits(owner, repo, user) if user else False
-        tags = _github.list_tags(owner, repo)
-        return has, tags
+def _pypi_probe_factory(enable: bool):
+    if not enable:
+        return None
+    def probe(name: str):
+        # SC-008 only needs registration timing — skip the install-
+        # script hash probe that fetch_package normally runs.
+        return _pypi.fetch_package(name, include_install_script_hash=False)
     return probe
 
 
@@ -164,7 +158,7 @@ def baseline() -> None:
 
 @baseline.command("init")
 @click.option("--manifest", required=True, metavar="PATH",
-              help="Path to the dependency manifest (e.g. requirements.txt).")
+              help="Path to the dependency manifest (requirements.txt or package.json).")
 @click.option("--ecosystem",
               type=click.Choice(["pypi", "npm"], case_sensitive=False),
               default="pypi", show_default=True,
@@ -178,16 +172,14 @@ def baseline_init(ctx: click.Context, manifest: str, ecosystem: str) -> None:
     invocations compare against these snapshots.
     """
     ecosystem = ecosystem.lower()
-    if ecosystem != "pypi":
-        raise click.UsageError(
-            "Only --ecosystem pypi is implemented in this release. "
-            "npm support arrives with Module 1b."
-        )
     if not os.path.isfile(manifest):
         raise click.UsageError(f"--manifest file not found: {manifest}")
 
     debug = _debug_factory(ctx.obj["verbose"], ctx.obj["quiet"])
-    entries = _supply.parse_requirements_txt(manifest)
+    try:
+        entries = _supply.parse_manifest(manifest, ecosystem)
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
     debug(f"parsed {len(entries)} entries from {manifest}")
     if not entries:
         click.echo(f"[init] {manifest} contained no packages.", err=True)
@@ -197,7 +189,7 @@ def baseline_init(ctx: click.Context, manifest: str, ecosystem: str) -> None:
     debug(f"opening baseline at {path}")
     try:
         with Store.open(path) as store:
-            result = _supply.scan(store, entries, mode="init")
+            result = _supply.scan(store, entries, ecosystem=ecosystem, mode="init")
     except Exception as exc:  # noqa: BLE001
         import traceback
         click.echo(f"[error] baseline init failed: {exc}", err=True)
@@ -266,12 +258,15 @@ def _render_snapshot(console: Console, snap) -> None:
     table.add_column("Value")
     table.add_row("ecosystem", snap.ecosystem)
     table.add_row("recorded_at", snap.recorded_at)
+    table.add_row("release_uploaded_at", snap.release_uploaded_at or "-")
     table.add_row("release_hour (UTC)",
                   "-" if snap.release_hour is None else f"{snap.release_hour:02d}")
     table.add_row("release_weekday",
                   "-" if snap.release_weekday is None else str(snap.release_weekday))
     table.add_row("has_install_script", str(snap.has_install_script))
     table.add_row("install_script_hash", snap.install_script_hash or "-")
+    table.add_row("manifest_constraint", snap.manifest_constraint or "-")
+    table.add_row("yanked_or_deprecated", str(snap.yanked))
     maintainer_names = ", ".join(m.get("name", "") for m in snap.maintainers) or "-"
     table.add_row("maintainers", maintainer_names)
     deps = ", ".join(f"{k}{v}" for k, v in snap.dependencies.items()) or "-"
@@ -333,7 +328,7 @@ def scan() -> None:
 
 @scan.command("deps")
 @click.option("--manifest", required=True, metavar="PATH",
-              help="Path to the dependency manifest (e.g. requirements.txt).")
+              help="Path to the dependency manifest (requirements.txt or package.json).")
 @click.option("--ecosystem",
               type=click.Choice(["pypi", "npm"], case_sensitive=False),
               default="pypi", show_default=True)
@@ -349,43 +344,49 @@ def scan() -> None:
               help="Exit 1 when any finding is at or above this severity.")
 @click.option("--no-github", is_flag=True, default=False,
               help="Skip GitHub API calls — SC-001/SC-003 confidence drops to MEDIUM.")
-@click.option("--no-npm", is_flag=True, default=False,
-              help="Skip npm registry calls — disables SC-008.")
+@click.option("--no-cross-ecosystem", is_flag=True, default=False,
+              help="Skip cross-ecosystem lookups — disables SC-008.")
 @click.pass_context
 def scan_deps(
     ctx: click.Context, manifest: str, ecosystem: str,
     output: str, output_file: str | None,
-    fail_on: str, no_github: bool, no_npm: bool,
+    fail_on: str, no_github: bool, no_cross_ecosystem: bool,
 ) -> None:
     """Scan a dependency manifest against the baseline.
 
     First run needs ``pipeline_watch baseline init`` to establish a
-    starting point. Subsequent runs diff PyPI's current view against
-    the stored snapshot and emit findings.
+    starting point. Subsequent runs diff the registry's current view
+    against the stored snapshot and emit findings.
     """
     ecosystem = ecosystem.lower()
-    if ecosystem != "pypi":
-        raise click.UsageError(
-            "Only --ecosystem pypi is implemented in this release."
-        )
     if not os.path.isfile(manifest):
         raise click.UsageError(f"--manifest file not found: {manifest}")
 
     debug = _debug_factory(ctx.obj["verbose"], ctx.obj["quiet"])
-    entries = _supply.parse_requirements_txt(manifest)
+    try:
+        entries = _supply.parse_manifest(manifest, ecosystem)
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
     debug(f"parsed {len(entries)} entries from {manifest}")
 
     path = ctx.obj["baseline_db"]
     debug(f"opening baseline at {path}")
     github_probe = None if no_github else _github_probe_factory(True)
-    npm_probe = None if no_npm else _npm_probe_factory(True)
+    # SC-008 is bidirectional: a PyPI manifest cross-checks npm, and
+    # vice versa. We enable only the opposite-ecosystem probe.
+    if no_cross_ecosystem:
+        npm_probe = None
+        pypi_probe = None
+    else:
+        npm_probe = _npm_probe_factory(ecosystem == "pypi")
+        pypi_probe = _pypi_probe_factory(ecosystem == "npm")
 
     try:
         with Store.open(path) as store:
             # When the baseline is empty, surface that clearly rather
             # than silently emitting no findings (and misleading the
             # operator into thinking all is well).
-            if not store.all_packages("pypi") and not ctx.obj["quiet"]:
+            if not store.all_packages(ecosystem) and not ctx.obj["quiet"]:
                 click.echo(
                     "[scan] baseline is empty; treating this run as a fresh init. "
                     "Re-run after a real release to see findings.",
@@ -395,8 +396,10 @@ def scan_deps(
             else:
                 mode = "scan"
             result = _supply.scan(
-                store, entries,
-                github_probe=github_probe, npm_probe=npm_probe, mode=mode,
+                store, entries, ecosystem=ecosystem,
+                github_probe=github_probe,
+                npm_probe=npm_probe, pypi_probe=pypi_probe,
+                mode=mode,
             )
     except Exception as exc:  # noqa: BLE001
         import traceback
@@ -481,7 +484,7 @@ def scan_all(
         output_file=output_file,
         fail_on=fail_on,
         no_github=False,
-        no_npm=False,
+        no_cross_ecosystem=False,
     )
 
 

@@ -37,14 +37,14 @@ def _snap(**overrides) -> PackageSnapshot:
 
 
 def test_schema_is_current_on_open(store: Store) -> None:
-    assert store.schema_version() == 1
+    assert store.schema_version() == 2
 
 
 def test_migration_is_idempotent(store: Store) -> None:
     # Running migrate again (via the constructor's side effect) must
     # not duplicate tables or change the version.
     Store(store.conn)  # re-entry
-    assert store.schema_version() == 1
+    assert store.schema_version() == 2
     tables = {
         row[0] for row in store.conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table';"
@@ -229,6 +229,6 @@ def test_open_creates_parent_dir(tmp_path) -> None:
     s = Store.open(target)
     try:
         assert target.exists()
-        assert s.schema_version() == 1
+        assert s.schema_version() == 2
     finally:
         s.close()

@@ -12,12 +12,16 @@ from pipeline_watch.detectors.supply_chain import (
     scan,
     signal_constraint_loosened,
     signal_cross_ecosystem,
+    signal_dormant_revival,
     signal_install_script_change,
+    signal_maintainer_removed,
     signal_new_maintainer,
     signal_new_transitive_dep,
     signal_off_hours_release,
     signal_release_without_tag,
     signal_typosquat,
+    signal_version_downgrade,
+    signal_yanked_or_deprecated,
 )
 from pipeline_watch.output.schema import Severity
 from pipeline_watch.providers import npm as _npm
@@ -268,7 +272,9 @@ def test_sc008_fires_within_window() -> None:
     created = (NOW - timedelta(days=10)).isoformat()
     def probe(name: str):  # noqa: ARG001
         return _npm.NpmPackageInfo(name=name, created_iso=created)
-    findings = signal_cross_ecosystem(entry, npm_probe=probe, now=NOW)
+    findings = signal_cross_ecosystem(
+        entry, ecosystem="pypi", npm_probe=probe, pypi_probe=None, now=NOW,
+    )
     assert len(findings) == 1
     assert findings[0].check_id == "SC-008"
 
@@ -278,14 +284,136 @@ def test_sc008_skipped_when_registered_long_ago() -> None:
     created = (NOW - timedelta(days=365)).isoformat()
     def probe(name: str):  # noqa: ARG001
         return _npm.NpmPackageInfo(name=name, created_iso=created)
-    assert signal_cross_ecosystem(entry, npm_probe=probe, now=NOW) == []
+    assert signal_cross_ecosystem(
+        entry, ecosystem="pypi", npm_probe=probe, pypi_probe=None, now=NOW,
+    ) == []
 
 
 def test_sc008_skipped_when_not_on_npm() -> None:
     entry = ManifestEntry(name="requests", constraint="", source_line="requests")
     def probe(name: str):  # noqa: ARG001
         return None
-    assert signal_cross_ecosystem(entry, npm_probe=probe, now=NOW) == []
+    assert signal_cross_ecosystem(
+        entry, ecosystem="pypi", npm_probe=probe, pypi_probe=None, now=NOW,
+    ) == []
+
+
+def test_sc008_npm_manifest_cross_checks_pypi() -> None:
+    """An npm manifest entry cross-checks PyPI in the opposite direction."""
+    from pipeline_watch.providers.pypi import PyPIPackage, PyPIRelease
+
+    entry = ManifestEntry(name="internal-utils", constraint="", source_line="internal-utils")
+    recent = (NOW - timedelta(days=5)).isoformat()
+
+    def probe(name: str):  # noqa: ARG001
+        return PyPIPackage(
+            name=name, latest_version="0.1.0", maintainers=[],
+            releases=[PyPIRelease(
+                version="0.1.0", upload_time_iso=recent,
+                sdist_url=None, has_install_script=False, install_script_hash=None,
+            )],
+            dependencies={}, project_urls={},
+        )
+    findings = signal_cross_ecosystem(
+        entry, ecosystem="npm", npm_probe=None, pypi_probe=probe, now=NOW,
+    )
+    assert len(findings) == 1
+    assert findings[0].check_id == "SC-008"
+    assert findings[0].evidence["registered_ecosystem"] == "pypi"
+
+
+# ── SC-009 maintainer removed ───────────────────────────────────────
+
+
+def test_sc009_fires_on_complete_swap() -> None:
+    prev = _snap(maintainers=[{"name": "alice"}, {"name": "bob"}])
+    current = _snap(maintainers=[{"name": "mallory"}, {"name": "eve"}])
+    findings = signal_maintainer_removed(prev, current)
+    assert len(findings) == 1
+    assert findings[0].check_id == "SC-009"
+    assert findings[0].severity == Severity.HIGH
+
+
+def test_sc009_skipped_when_any_overlap() -> None:
+    prev = _snap(maintainers=[{"name": "alice"}, {"name": "bob"}])
+    current = _snap(maintainers=[{"name": "alice"}, {"name": "mallory"}])
+    assert signal_maintainer_removed(prev, current) == []
+
+
+def test_sc009_needs_both_sides_populated() -> None:
+    prev = _snap(maintainers=[])
+    current = _snap(maintainers=[{"name": "mallory"}])
+    assert signal_maintainer_removed(prev, current) == []
+
+
+# ── SC-010 version downgrade ────────────────────────────────────────
+
+
+def test_sc010_fires_when_latest_drops() -> None:
+    prev = _snap(version="2.31.0")
+    current = _snap(version="2.30.0")
+    findings = signal_version_downgrade(prev, current)
+    assert len(findings) == 1
+    assert findings[0].check_id == "SC-010"
+
+
+def test_sc010_skipped_on_forward_progress() -> None:
+    prev = _snap(version="2.31.0")
+    current = _snap(version="2.32.0")
+    assert signal_version_downgrade(prev, current) == []
+
+
+def test_sc010_skipped_on_same_version() -> None:
+    prev = _snap(version="2.31.0")
+    current = _snap(version="2.31.0")
+    assert signal_version_downgrade(prev, current) == []
+
+
+# ── SC-011 dormant revival ──────────────────────────────────────────
+
+
+def test_sc011_fires_after_long_silence() -> None:
+    prev = _snap(
+        version="1.0.0",
+        release_uploaded_at="2020-01-01T12:00:00+00:00",
+    )
+    current = _snap(
+        version="1.1.0",
+        release_uploaded_at="2026-04-20T12:00:00+00:00",
+    )
+    findings = signal_dormant_revival(prev, current)
+    assert len(findings) == 1
+    assert findings[0].check_id == "SC-011"
+
+
+def test_sc011_skipped_within_dormant_threshold() -> None:
+    prev = _snap(release_uploaded_at="2026-01-01T00:00:00+00:00")
+    current = _snap(
+        version="1.1.0",
+        release_uploaded_at="2026-04-20T00:00:00+00:00",
+    )
+    assert signal_dormant_revival(prev, current) == []
+
+
+def test_sc011_skipped_without_timestamps() -> None:
+    prev = _snap(release_uploaded_at="")
+    current = _snap(release_uploaded_at="")
+    assert signal_dormant_revival(prev, current) == []
+
+
+# ── SC-012 yanked or deprecated ─────────────────────────────────────
+
+
+def test_sc012_fires_when_yanked() -> None:
+    current = _snap(yanked=True)
+    findings = signal_yanked_or_deprecated(current)
+    assert len(findings) == 1
+    assert findings[0].check_id == "SC-012"
+    assert findings[0].severity == Severity.HIGH
+
+
+def test_sc012_skipped_when_live() -> None:
+    assert signal_yanked_or_deprecated(_snap(yanked=False)) == []
 
 
 # ── Manifest parser ─────────────────────────────────────────────────
@@ -393,3 +521,23 @@ def test_scan_invalid_mode() -> None:
     store = Store.__new__(Store)  # not actually used; mode is checked first
     with pytest.raises(ValueError):
         scan(store, [], mode="wrong")
+
+
+def test_scan_invalid_ecosystem() -> None:
+    store = Store.__new__(Store)
+    with pytest.raises(ValueError):
+        scan(store, [], ecosystem="cargo")
+
+
+def test_sc006_uses_stored_manifest_constraint(install_fake_fetcher, store: Store) -> None:
+    """SC-006 reaches across runs by reading the stored manifest constraint."""
+    install_fake_fetcher({PYPI_JSON_URL.format(package="requests"): _requests_doc()})
+    pinned = [ManifestEntry(name="requests", constraint="==2.31.0", source_line="requests==2.31.0")]
+    scan(store, pinned, mode="init", now=NOW)
+
+    install_fake_fetcher({
+        PYPI_JSON_URL.format(package="requests"): _requests_doc(version="2.32.0"),
+    })
+    loosened = [ManifestEntry(name="requests", constraint=">=2.31", source_line="requests>=2.31")]
+    result = scan(store, loosened, mode="scan", now=NOW + timedelta(days=1))
+    assert any(f.check_id == "SC-006" for f in result.findings)

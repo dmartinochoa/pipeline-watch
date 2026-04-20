@@ -41,7 +41,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 # Each entry runs once, ordered, when the db's ``user_version`` is
 # below the entry's index. Appending a migration is safe — never
@@ -109,6 +109,15 @@ _MIGRATIONS: list[str] = [
         UNIQUE(scope, metric)
     );
     """,
+    # v2 — persist manifest constraint and release-upload timestamp
+    # on each snapshot. manifest_constraint powers SC-006 across runs;
+    # release_uploaded_at powers SC-011 dormant-revival and SC-010
+    # version-downgrade comparisons.
+    """
+    ALTER TABLE package_snapshots ADD COLUMN manifest_constraint TEXT;
+    ALTER TABLE package_snapshots ADD COLUMN release_uploaded_at TEXT;
+    ALTER TABLE package_snapshots ADD COLUMN yanked INTEGER NOT NULL DEFAULT 0;
+    """,
 ]
 
 
@@ -125,6 +134,9 @@ class PackageSnapshot:
     install_script_hash: str | None = None
     dependencies: dict[str, str] = field(default_factory=dict)
     recorded_at: str = ""
+    manifest_constraint: str = ""
+    release_uploaded_at: str = ""
+    yanked: bool = False
 
     def to_row(self) -> tuple:
         return (
@@ -138,10 +150,18 @@ class PackageSnapshot:
             self.install_script_hash,
             json.dumps(self.dependencies),
             self.recorded_at,
+            self.manifest_constraint,
+            self.release_uploaded_at,
+            1 if self.yanked else 0,
         )
 
     @classmethod
     def from_row(cls, row: sqlite3.Row | tuple) -> PackageSnapshot:
+        def _get(key: str, default: Any = None) -> Any:
+            try:
+                return row[key]
+            except (IndexError, KeyError):
+                return default
         return cls(
             ecosystem=row["ecosystem"],
             package=row["package"],
@@ -153,6 +173,9 @@ class PackageSnapshot:
             install_script_hash=row["install_script_hash"],
             dependencies=json.loads(row["dependencies"] or "{}"),
             recorded_at=row["recorded_at"],
+            manifest_constraint=_get("manifest_constraint") or "",
+            release_uploaded_at=_get("release_uploaded_at") or "",
+            yanked=bool(_get("yanked") or 0),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -254,8 +277,9 @@ class Store:
                 (ecosystem, package, version, maintainers,
                  release_hour, release_weekday,
                  has_install_script, install_script_hash,
-                 dependencies, recorded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                 dependencies, recorded_at,
+                 manifest_constraint, release_uploaded_at, yanked)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """,
             snap.to_row(),
         )

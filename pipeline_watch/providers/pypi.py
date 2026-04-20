@@ -108,6 +108,9 @@ class PyPIRelease:
     sdist_url: str | None
     has_install_script: bool
     install_script_hash: str | None
+    install_script_size: int = 0
+    yanked: bool = False
+    yanked_reason: str = ""
 
     def upload_datetime(self) -> datetime | None:
         try:
@@ -169,23 +172,27 @@ def fetch_package(name: str, *, include_install_script_hash: bool = True) -> PyP
     for version, files in releases_map.items():
         sdist = _pick_sdist(files)
         upload_time = _pick_upload_time(files)
+        yanked, yanked_reason = _pick_yanked(files)
         has_hook = False
         hook_hash: str | None = None
+        hook_size = 0
         if include_install_script_hash and version == latest_version and sdist:
             try:
-                has_hook, hook_hash = _probe_install_script(sdist["url"])
+                has_hook, hook_hash, hook_size = _probe_install_script(sdist["url"])
             except Exception:
-                # A failed probe shouldn't break the snapshot — we simply
-                # record "we don't know" and move on. Catching broadly is
-                # intentional: a corrupted sdist, a 404, or a read timeout
-                # all deserve the same "degrade gracefully" treatment.
-                has_hook, hook_hash = False, None
+                # A failed probe shouldn't break the snapshot — record
+                # "we don't know" and move on. A corrupted sdist, 404,
+                # or read timeout all deserve graceful degradation.
+                has_hook, hook_hash, hook_size = False, None, 0
         releases.append(PyPIRelease(
             version=version,
             upload_time_iso=upload_time,
             sdist_url=sdist.get("url") if sdist else None,
             has_install_script=has_hook,
             install_script_hash=hook_hash,
+            install_script_size=hook_size,
+            yanked=yanked,
+            yanked_reason=yanked_reason,
         ))
 
     # Sort newest first for the detector's convenience. Tie-break on
@@ -203,13 +210,20 @@ def fetch_package(name: str, *, include_install_script_hash: bool = True) -> PyP
     )
 
 
-def snapshot_from_package(pkg: PyPIPackage, *, recorded_at: str) -> PackageSnapshot:
+def snapshot_from_package(
+    pkg: PyPIPackage,
+    *,
+    recorded_at: str,
+    manifest_constraint: str = "",
+) -> PackageSnapshot:
     """Convert a ``PyPIPackage`` into the ``PackageSnapshot`` row the store holds."""
     latest = pkg.latest_release()
     hour: int | None = None
     weekday: int | None = None
+    upload_iso = ""
     if latest:
         dt = latest.upload_datetime()
+        upload_iso = latest.upload_time_iso or ""
         if dt:
             hour = dt.hour
             weekday = dt.weekday()
@@ -224,6 +238,9 @@ def snapshot_from_package(pkg: PyPIPackage, *, recorded_at: str) -> PackageSnaps
         install_script_hash=latest.install_script_hash if latest else None,
         dependencies=pkg.dependencies,
         recorded_at=recorded_at,
+        manifest_constraint=manifest_constraint,
+        release_uploaded_at=upload_iso,
+        yanked=bool(latest and latest.yanked),
     )
 
 
@@ -293,8 +310,19 @@ def _pick_upload_time(files: list[dict]) -> str:
     return min(times) if times else ""
 
 
-def _probe_install_script(sdist_url: str) -> tuple[bool, str | None]:
-    """Download *sdist_url* and return ``(has_hook, hash)`` over install-script files.
+def _pick_yanked(files: list[dict]) -> tuple[bool, str]:
+    """Return (is_yanked, reason) — true when any file of the release is yanked."""
+    reason = ""
+    yanked = False
+    for f in files:
+        if f.get("yanked"):
+            yanked = True
+            reason = str(f.get("yanked_reason") or "") or reason
+    return yanked, reason
+
+
+def _probe_install_script(sdist_url: str) -> tuple[bool, str | None, int]:
+    """Download *sdist_url* and return ``(has_hook, hash, total_bytes)`` over install-script files.
 
     "Hook" here means any of setup.py / setup.cfg / pyproject.toml /
     __init__.py — the files an attacker typically modifies when
@@ -324,24 +352,26 @@ def _probe_install_script(sdist_url: str) -> tuple[bool, str | None]:
                 if name in _SDIST_HOOKED_FILES:
                     relevant.append((info.filename, zf.read(info)))
     else:
-        return False, None
+        return False, None, 0
 
     if not relevant:
-        return False, None
+        return False, None, 0
 
     h = hashlib.sha256()
+    total = 0
     for path, data in sorted(relevant, key=lambda x: x[0]):
         h.update(path.encode("utf-8"))
         h.update(b"\0")
         h.update(data)
         h.update(b"\0")
-    # ``has_install_script`` is true when *setup.py*, *setup.cfg*, or
-    # *pyproject.toml* declares a ``[tool.setuptools.cmdclass]`` /
-    # ``cmdclass`` hook, or when ``__init__.py`` is non-trivially
-    # present (common trojan vector). A coarse "hooks present" flag
-    # is enough for the baseline diff.
+        total += len(data)
+    # "has_install_script" is true when setup.py / setup.cfg /
+    # pyproject.toml is present (build hook surface), or when any
+    # __init__.py showed up (common trojan vector in event-stream and
+    # ctx compromises). A coarse "hooks present" flag is enough to
+    # drive the baseline diff.
     has_hook = any(
         name.rsplit("/", 1)[-1] in {"setup.py", "setup.cfg", "pyproject.toml"}
         for name, _ in relevant
     )
-    return has_hook, h.hexdigest()
+    return has_hook, h.hexdigest(), total

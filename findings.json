@@ -10,16 +10,16 @@
         "count": 0
       },
       "HIGH": {
-        "count": 3
+        "count": 6
       },
       "MEDIUM": {
-        "count": 3
+        "count": 4
       },
       "LOW": {
         "count": 2
       }
     },
-    "total": 8
+    "total": 12
   },
   "findings": [
     {
@@ -65,7 +65,7 @@
       "module": "supply-chain",
       "severity": "HIGH",
       "score": "D",
-      "signal": "requests 2.32.0 was published to PyPI but no matching tag exists in https://github.com/psf/requests.",
+      "signal": "requests 2.32.0 was published but no matching tag exists in https://github.com/psf/requests.",
       "baseline": "Recent tags in source repo: v2.30.0, v2.31.0",
       "evidence": {
         "package": "requests",
@@ -73,13 +73,14 @@
         "source_repo": "https://github.com/psf/requests",
         "tried_tags": [
           "2.32.0",
+          "release-2.32.0",
           "requests-2.32.0",
           "requests/2.32.0",
           "v2.32.0"
         ]
       },
       "timestamp": "2026-04-20T12:00:00+00:00",
-      "remediation": "Publishing without tagging is the signature of a compromised registry credential. Pin away from this version, open an issue upstream, and preserve the sdist for incident response.",
+      "remediation": "Publishing without tagging is the signature of a compromised registry credential. Pin away from this version, open an issue upstream, and preserve the artifact for incident response.",
       "check_id": "SC-003"
     },
     {
@@ -97,7 +98,7 @@
         "current_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
       },
       "timestamp": "2026-04-20T12:00:00+00:00",
-      "remediation": "Review the diff of setup.py / __init__.py between the two sdists. Install-script additions are the signature of the event-stream and ctx-typosquat compromises.",
+      "remediation": "Diff setup.py / __init__.py / package.json scripts between the two releases. Install-hook changes are the signature of the event-stream and ctx typosquat compromises.",
       "check_id": "SC-004"
     },
     {
@@ -118,7 +119,7 @@
         ]
       },
       "timestamp": "2026-04-20T12:00:00+00:00",
-      "remediation": "A new transitive dependency is not automatically malicious, but verify the release notes explain it. Run this package through pipeline-check against the new dep's source tree.",
+      "remediation": "A new transitive dependency is not automatically malicious, but verify the release notes explain it. Run pipeline-check against the new dep's source tree.",
       "check_id": "SC-005"
     },
     {
@@ -158,16 +159,91 @@
       "module": "supply-chain",
       "severity": "MEDIUM",
       "score": "C",
-      "signal": "A package named 'requests' was registered on npm 10 day(s) ago \u2014 matching a PyPI name in your manifest.",
+      "signal": "A package named 'requests' was registered on npm 10 day(s) ago \u2014 matching a pypi name in your manifest.",
       "baseline": "Cross-ecosystem collisions registered within the last 30 days are a known dependency-confusion vector.",
       "evidence": {
         "package": "requests",
-        "npm_registered": "2026-04-10T12:00:00+00:00",
+        "manifest_ecosystem": "pypi",
+        "registered_ecosystem": "npm",
+        "registration_iso": "2026-04-10T12:00:00+00:00",
+        "source_url": "https://www.npmjs.com/package/requests",
         "window_days": 30
       },
       "timestamp": "2026-04-20T12:00:00+00:00",
-      "remediation": "Register the same name defensively on the other ecosystem, or add a resolver pin to prevent a package-manager lookup from silently switching ecosystems.",
+      "remediation": "Register the same name defensively on the other ecosystem, or add a resolver pin so a package-manager lookup can't silently switch ecosystems.",
       "check_id": "SC-008"
+    },
+    {
+      "tool": "pipeline-watch",
+      "module": "supply-chain",
+      "severity": "HIGH",
+      "score": "D",
+      "signal": "requests maintainer list completely replaced \u2014 no previously known maintainer remains.",
+      "baseline": "Previous maintainers: alice. Current maintainers: mallory.",
+      "evidence": {
+        "package": "requests",
+        "previous_maintainers": [
+          "alice"
+        ],
+        "current_maintainers": [
+          "mallory"
+        ]
+      },
+      "timestamp": "2026-04-20T12:00:00+00:00",
+      "remediation": "Freeze the dependency immediately. A total ownership swap is the fingerprint of a hijacked account or abandoned-package takeover (ua-parser-js, event-stream).",
+      "check_id": "SC-009"
+    },
+    {
+      "tool": "pipeline-watch",
+      "module": "supply-chain",
+      "severity": "HIGH",
+      "score": "D",
+      "signal": "colors's advertised latest dropped from 1.4.2 to 1.4.1.",
+      "baseline": "Prior recorded version: 1.4.2.",
+      "evidence": {
+        "package": "colors",
+        "previous_version": "1.4.2",
+        "current_version": "1.4.1"
+      },
+      "timestamp": "2026-04-20T12:00:00+00:00",
+      "remediation": "Pin the last known-good version and investigate whether the registry account published a rollback or whether the newer release was unpublished.",
+      "check_id": "SC-010"
+    },
+    {
+      "tool": "pipeline-watch",
+      "module": "supply-chain",
+      "severity": "MEDIUM",
+      "score": "C",
+      "signal": "requests 2.32.0 was published 1570 days after 1.4.2 \u2014 a long dormant period followed by a sudden release.",
+      "baseline": "Previous release 1.4.2 was uploaded 2022-01-01T03:00:00+00:00.",
+      "evidence": {
+        "package": "requests",
+        "previous_version": "1.4.2",
+        "previous_uploaded_at": "2022-01-01T03:00:00+00:00",
+        "current_version": "2.32.0",
+        "current_uploaded_at": "2026-04-20T12:00:00+00:00",
+        "dormant_days": 1570,
+        "threshold_days": 365
+      },
+      "timestamp": "2026-04-20T12:00:00+00:00",
+      "remediation": "Dormant packages that suddenly republish are a prized target for attackers. Confirm the maintainer announced the revival before trusting the new release.",
+      "check_id": "SC-011"
+    },
+    {
+      "tool": "pipeline-watch",
+      "module": "supply-chain",
+      "severity": "HIGH",
+      "score": "D",
+      "signal": "requests 2.32.0 is currently marked yanked on pypi.",
+      "baseline": "A yanked release means the maintainer (or the registry) has withdrawn the artefact from normal use.",
+      "evidence": {
+        "package": "requests",
+        "version": "2.32.0",
+        "ecosystem": "pypi"
+      },
+      "timestamp": "2026-04-20T12:00:00+00:00",
+      "remediation": "Pin off this version. Yanked/deprecated releases are either broken or actively harmful \u2014 installers will still resolve them unless you pin away.",
+      "check_id": "SC-012"
     }
   ]
 }

@@ -12,19 +12,30 @@ from pipeline_watch.providers import pypi as _pypi
 from pipeline_watch.providers.pypi import PYPI_JSON_URL
 
 
-def _pypi_doc(version: str = "2.31.0", *, maintainer: str = "Kenneth Reitz", deps: list[str] | None = None) -> dict:
+def _pypi_doc(
+    version: str = "2.31.0",
+    *,
+    maintainer: str = "Kenneth Reitz",
+    extra_maintainer: str | None = None,
+    deps: list[str] | None = None,
+    upload_time_iso: str = "2023-05-22T14:30:00Z",
+) -> dict:
+    info: dict = {
+        "name": "requests", "version": version,
+        "author": maintainer, "author_email": "me@example.com",
+        "project_urls": {"Source": "https://github.com/psf/requests"},
+        "requires_dist": deps or ["urllib3 (<3,>=1.21.1)"],
+    }
+    if extra_maintainer is not None:
+        info["maintainer"] = extra_maintainer
+        info["maintainer_email"] = f"{extra_maintainer.lower()}@example.com"
     return {
-        "info": {
-            "name": "requests", "version": version,
-            "author": maintainer, "author_email": "me@example.com",
-            "project_urls": {"Source": "https://github.com/psf/requests"},
-            "requires_dist": deps or ["urllib3 (<3,>=1.21.1)"],
-        },
+        "info": info,
         "releases": {
             version: [{
                 "packagetype": "sdist",
                 "url": f"https://files.pythonhosted.org/packages/z/requests-{version}.tar.gz",
-                "upload_time_iso_8601": "2023-05-22T14:30:00Z",
+                "upload_time_iso_8601": upload_time_iso,
             }],
         },
     }
@@ -83,7 +94,7 @@ def test_cli_baseline_init_and_scan(tmp_path: Path, monkeypatch) -> None:
             "--ecosystem", "pypi",
             "--output", "json",
             "--output-file", str(out),
-            "--no-github", "--no-npm",
+            "--no-github", "--no-cross-ecosystem",
         ], catch_exceptions=False)
         assert r.exit_code == 0, r.output
         payload = json.loads(out.read_text(encoding="utf-8"))
@@ -92,9 +103,11 @@ def test_cli_baseline_init_and_scan(tmp_path: Path, monkeypatch) -> None:
         assert payload["score"]["grade"] == "A"
         assert payload["findings"] == []
 
-        # 4) scan deps after PyPI flipped to a new maintainer → SC-001 fires.
+        # 4) scan deps after PyPI added a new co-maintainer → SC-001 fires
+        #    at MEDIUM (no github probe). The original Kenneth is still
+        #    listed, so SC-009 (full maintainer swap) does NOT fire.
         _route_pypi({PYPI_JSON_URL.format(package="requests"):
-                     _pypi_doc(version="2.32.0", maintainer="mallory")})
+                     _pypi_doc(version="2.32.0", extra_maintainer="mallory")})
         r = runner.invoke(cli, [
             "--baseline-db", str(baseline_db),
             "scan", "deps",
@@ -102,7 +115,7 @@ def test_cli_baseline_init_and_scan(tmp_path: Path, monkeypatch) -> None:
             "--ecosystem", "pypi",
             "--output", "json",
             "--output-file", str(out),
-            "--no-github", "--no-npm",
+            "--no-github", "--no-cross-ecosystem",
             "--fail-on", "HIGH",
         ], catch_exceptions=False)
         # MEDIUM (no github probe) → gate at HIGH still passes.
@@ -110,8 +123,8 @@ def test_cli_baseline_init_and_scan(tmp_path: Path, monkeypatch) -> None:
         payload = json.loads(out.read_text(encoding="utf-8"))
         assert any(f["check_id"] == "SC-001" for f in payload["findings"])
 
-        # 5) Reset the package, re-init against alice, then a fresh scan
-        #    with mallory should fire SC-001 *and* fail the MEDIUM gate.
+        # 5) Reset the package, re-init against Kenneth, then a fresh scan
+        #    with mallory added should fire SC-001 *and* fail the MEDIUM gate.
         runner.invoke(cli, [
             "--baseline-db", str(baseline_db),
             "baseline", "reset", "--scope", "package:requests",
@@ -123,7 +136,7 @@ def test_cli_baseline_init_and_scan(tmp_path: Path, monkeypatch) -> None:
             "--manifest", str(manifest),
         ], catch_exceptions=False)
         _route_pypi({PYPI_JSON_URL.format(package="requests"):
-                     _pypi_doc(version="2.32.0", maintainer="mallory")})
+                     _pypi_doc(version="2.32.0", extra_maintainer="mallory")})
         r = runner.invoke(cli, [
             "--baseline-db", str(baseline_db),
             "scan", "deps",
@@ -131,7 +144,7 @@ def test_cli_baseline_init_and_scan(tmp_path: Path, monkeypatch) -> None:
             "--ecosystem", "pypi",
             "--output", "json",
             "--output-file", str(out),
-            "--no-github", "--no-npm",
+            "--no-github", "--no-cross-ecosystem",
             "--fail-on", "MEDIUM",
         ], catch_exceptions=False)
         assert r.exit_code == 1, r.output
