@@ -349,6 +349,89 @@ def test_github_fetch_json_non_json_raises() -> None:
         _github.set_fetcher(None)
 
 
+def test_pypi_release_upload_datetime_invalid_returns_none() -> None:
+    r = _pypi.PyPIRelease(
+        version="1.0", upload_time_iso="garbage", sdist_url=None,
+        has_install_script=False, install_script_hash=None,
+    )
+    assert r.upload_datetime() is None
+
+
+def test_pypi_latest_release_falls_back_to_first_when_no_match() -> None:
+    """If latest_version doesn't match any release, we fall back to releases[0]."""
+    a = _pypi.PyPIRelease(
+        version="1.0", upload_time_iso="2020-01-01T00:00:00Z", sdist_url=None,
+        has_install_script=False, install_script_hash=None,
+    )
+    pkg = _pypi.PyPIPackage(
+        name="x", latest_version="99.0",  # no matching release
+        maintainers=[], releases=[a], dependencies={}, project_urls={},
+    )
+    assert pkg.latest_release() is a
+
+
+def test_pypi_pick_sdist_returns_none_when_only_wheels() -> None:
+    assert _pypi._pick_sdist([{"packagetype": "bdist_wheel"}]) is None
+
+
+def test_pypi_pick_yanked_returns_false_when_no_files_yanked() -> None:
+    assert _pypi._pick_yanked([{"packagetype": "sdist"}]) == (False, "")
+
+
+def test_pypi_pick_upload_time_returns_earliest() -> None:
+    earliest = _pypi._pick_upload_time([
+        {"upload_time_iso_8601": "2023-05-22T14:30:00Z"},
+        {"upload_time_iso_8601": "2023-05-22T10:00:00Z"},
+        {"upload_time": "2023-05-22T12:00:00Z"},
+    ])
+    assert earliest == "2023-05-22T10:00:00Z"
+
+
+def test_pypi_pick_upload_time_empty_list() -> None:
+    assert _pypi._pick_upload_time([]) == ""
+
+
+def test_npm_collect_dependencies_handles_non_dict() -> None:
+    assert _npm._collect_dependencies({"dependencies": ["not", "a", "dict"]}) == {}
+    assert _npm._collect_dependencies("not even a dict") == {}  # type: ignore[arg-type]
+
+
+def test_npm_collect_maintainers_drops_entries_without_name_or_email() -> None:
+    doc = {"maintainers": [{"name": "", "email": ""}, {"name": "good"}]}
+    latest = {"maintainers": [{"name": "", "email": ""}]}
+    result = _npm._collect_maintainers(doc, latest)
+    assert [m["name"] for m in result] == ["good"]
+
+
+def test_npm_maintainers_from_latest_view_are_included() -> None:
+    doc = {"maintainers": []}
+    latest = {"maintainers": [{"name": "alice"}]}
+    result = _npm._collect_maintainers(doc, latest)
+    assert any(m["name"] == "alice" for m in result)
+
+
+def test_npm_extract_repository_url_ignores_non_dict_source() -> None:
+    # Non-dict, non-string repository field → skip that source.
+    assert _npm._extract_repository_url({"repository": 42}, {}) is None
+
+
+def test_npm_fetch_package_empty_versions_handled() -> None:
+    doc = {
+        "name": "x", "dist-tags": {"latest": "1.0.0"},
+        "maintainers": [{"name": "m"}],
+        "versions": {},
+        "time": {},
+    }
+    _npm.set_fetcher(lambda url, timeout: json.dumps(doc).encode())  # noqa: ARG005
+    try:
+        pkg = _npm.fetch_package("x")
+        assert pkg is not None
+        assert pkg.releases == []
+        assert pkg.latest_release() is None
+    finally:
+        _npm.set_fetcher(None)
+
+
 def test_github_set_fetcher_reset_restores_default() -> None:
     # Set then reset — confirms the ``None`` branch assigns _default_fetcher.
     _github.set_fetcher(lambda url, timeout: b"[]")  # noqa: ARG005

@@ -2,11 +2,16 @@
 
 # Pipeline-Watch
 
+[![CI](https://github.com/dmartinochoa/pipeline-watch/actions/workflows/ci.yml/badge.svg)](https://github.com/dmartinochoa/pipeline-watch/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue)](pyproject.toml)
+[![Coverage](https://img.shields.io/badge/coverage-97%25-brightgreen)](#contributing)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Behavioural companion to [pipeline-check](https://github.com/dmartinochoa/pipeline-check).
 Pipeline-watch records a baseline of how your dependencies *actually*
 behave and flags every deviation.
 
-[Quick start](#quick-start) · [Signals](#signals) · [How it works](#how-it-works) · [CI integration](#ci-integration) · [Compliance](#compliance-mapping)
+[Quick start](#quick-start) · [Signals](#signals) · [How it works](#how-it-works) · [Compliance](#compliance-mapping) · [Contributing](#contributing)
 
 </div>
 
@@ -177,14 +182,30 @@ evidence for them.
 ## Contributing
 
 ```bash
-make install   # editable install + dev deps
-make test      # pytest
-make lint      # ruff
-make type      # mypy
+make install    # editable install + dev deps
+make test       # pytest — 216 tests, fully offline
+make coverage   # pytest + coverage report (min 92%)
+make lint       # ruff
+make type       # mypy
+make check      # lint + type + coverage (same gates CI runs)
 ```
 
 All network calls flow through injectable fetchers — `pytest` runs
-the full suite offline.
+the full suite offline in under two seconds.
+
+### CI
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every
+push and pull request:
+
+- **test** — pytest + coverage across Python 3.10 / 3.11 / 3.12 / 3.13
+  on Ubuntu, plus a 3.12 job on macOS and Windows
+- **lint** — `ruff check`
+- **typecheck** — `mypy`
+- **build** — `python -m build` (sdist + wheel) uploaded as an artifact
+
+Coverage is enforced at **92 %** via `fail_under` in
+[`pyproject.toml`](pyproject.toml). A failing gate blocks merge.
 
 ## License
 
