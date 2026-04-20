@@ -2,32 +2,13 @@
 
 # Pipeline-Watch
 
-**Catch supply-chain attacks as they happen — before CVE databases catch up.**
-
 Behavioural companion to [pipeline-check](https://github.com/dmartinochoa/pipeline-check).
-Pipeline-check audits what your pipeline is *configured* to do.
 Pipeline-watch records a baseline of how your dependencies *actually*
 behave and flags every deviation.
 
 [Quick start](#quick-start) · [Signals](#signals) · [How it works](#how-it-works) · [CI integration](#ci-integration) · [Compliance](#compliance-mapping)
 
 </div>
-
----
-
-## Why behavioural
-
-Static scanners (pipeline-check, Snyk, Dependabot) read configuration
-and tell you what *could* go wrong. They are blind to packages that
-look correctly configured but are being used maliciously —
-`event-stream`, `ctx`, `node-ipc`, `ua-parser-js`. No signature
-scanner flagged those at release; they were caught by humans noticing
-behaviour that felt wrong.
-
-Pipeline-watch automates that instinct. It snapshots every package in
-your manifest — maintainers, release cadence, install-hook hashes,
-dependency graph, publish status — and emits a finding whenever new
-observations drift from the baseline.
 
 ---
 
@@ -101,67 +82,6 @@ that triggered it.
 Severity downgrades happen when pipeline-watch lacks corroborating
 data — e.g. SC-001 falls from HIGH to MEDIUM when `--no-github`
 removes the "no prior commits" confirmation.
-
----
-
-## Real attacks this would have caught
-
-| Incident | Signals that fire |
-|----------|-------------------|
-| **event-stream (2018)** — co-maintainer added, `__init__.js` payload shipped | SC-001 + SC-004 |
-| **node-ipc (2022)** — maintainer publishes politically-motivated wipe payload | SC-002 + SC-004 |
-| **ctx / phpass typosquats (2022)** — similarly-named packages with `setup.py` hooks | SC-001 + SC-004 + SC-007 |
-| **colors / faker (2022)** — maintainer sabotage release | SC-002 + SC-003 |
-| **ua-parser-js (2021)** — hijacked publish token, new owner, install-hook added | SC-001 + SC-004 + SC-009 |
-| **Dependency-confusion campaigns** — internal name newly registered upstream | SC-008 |
-| **Rollback / unpublish attacks** — attacker re-publishes an older "latest" | SC-010 |
-| **`left-pad` / dormant-pkg revival** — long-quiet package suddenly publishes | SC-011 |
-
-A worked example is at [`findings.json`](findings.json).
-
----
-
-## CI integration
-
-Both tools emit the same JSON envelope so a dashboard can ingest both
-through one decoder:
-
-```json
-{
-  "schema_version": "1.0",
-  "tool": "pipeline-watch",
-  "tool_version": "0.1.0",
-  "module": "supply-chain",
-  "score": { "grade": "D", "total": 8 },
-  "findings": [
-    {
-      "tool": "pipeline-watch",
-      "module": "supply-chain",
-      "severity": "HIGH",
-      "signal": "New maintainer 'mallory' published requests 2.32.0.",
-      "baseline": "Previous maintainers for requests: alice.",
-      "evidence": { "package": "requests", "new_maintainer": "mallory" },
-      "remediation": "Freeze the dependency and verify the addition …",
-      "check_id": "SC-001",
-      "timestamp": "2026-04-20T12:00:00+00:00"
-    }
-  ]
-}
-```
-
-`score.grade` is **A** (clean), **B** (LOW only), **C** (MEDIUM or
-≥ 2 LOW), **D** (HIGH or CRITICAL) — gate-compatible with
-pipeline-check. Typical combined step:
-
-```yaml
-- run: pipeline_check --pipeline github --output json --output-file check.json
-- run: pipeline_watch scan all --manifest requirements.txt --output-file watch.json
-- run: |
-    jq -s '.[0].findings + .[1].findings | {tool: "combined", findings: .}' \
-       check.json watch.json > findings.json
-- uses: actions/upload-artifact@v4
-  with: { name: security, path: findings.json }
-```
 
 ---
 
