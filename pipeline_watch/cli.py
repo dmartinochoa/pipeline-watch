@@ -1,0 +1,493 @@
+"""CLI entry point.
+
+Usage
+-----
+    pipeline_watch baseline init --manifest requirements.txt --ecosystem pypi
+    pipeline_watch baseline show --package requests
+    pipeline_watch baseline reset --scope package:requests
+    pipeline_watch baseline stats
+
+    pipeline_watch scan deps --manifest requirements.txt --ecosystem pypi
+    pipeline_watch scan all --manifest requirements.txt --output findings.json
+
+Exit codes
+----------
+    0   No HIGH or CRITICAL findings (gate passes)
+    1   Gate failed — at least one HIGH or CRITICAL finding
+    2   Scanner failure (e.g. registry API error)
+
+The gate threshold mirrors pipeline-check: any ``D`` grade fails, so
+the two tools can share one CI step.
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+import click
+from rich import box
+from rich.console import Console
+from rich.table import Table
+
+from . import __version__
+from .baseline.store import Store, default_baseline_path
+from .detectors import supply_chain as _supply
+from .output.formatter import report_json, report_terminal
+from .output.schema import Severity, score_from_findings
+from .providers import github as _github
+from .providers import npm as _npm
+
+
+def _tolerate_unencodable_stdio() -> None:
+    """Make stdout/stderr tolerate non-ASCII characters on legacy consoles.
+
+    Windows ``cmd.exe`` defaults to cp1252; Rich output can include
+    box-drawing characters that cp1252 can't encode. Reconfiguring with
+    ``errors='replace'`` degrades the unprintables to ``?`` rather than
+    crashing the CLI before it emits anything useful.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, OSError):
+            pass
+
+
+_tolerate_unencodable_stdio()
+
+
+# ── Helpers ─────────────────────────────────────────────────────────
+
+
+def _resolve_baseline_path(explicit: str | None) -> Path:
+    if explicit:
+        return Path(explicit)
+    return default_baseline_path()
+
+
+def _github_probe_factory(enable: bool):
+    """Return a probe callable, or None if disabled.
+
+    Wrapped so the detector doesn't need to know about the module-level
+    fetcher — the probe signature is ``(owner, repo) -> (has_commits, tags)``.
+    """
+    if not enable:
+        return None
+    def probe(owner: str, repo: str) -> tuple[bool, list[str]]:
+        # user_has_commits needs an author; we only use the tag list
+        # for SC-003 and fall back to has_commits=False for SC-001
+        # when the probe itself can't answer (the detector passes a
+        # specific username via its own code path if available).
+        tags = _github.list_tags(owner, repo)
+        return False, tags
+    return probe
+
+
+def _npm_probe_factory(enable: bool):
+    if not enable:
+        return None
+    def probe(name: str):
+        return _npm.package_info(name)
+    return probe
+
+
+def _pair_github_probe(username_map: dict[str, str] | None):
+    """Return a probe that uses the real GitHub client for commit history.
+
+    Wraps both SC-001's "has_commits" lookup and SC-003's tag list into
+    a single callable, so the detector's GitHubProbe signature stays
+    stable.
+    """
+    def probe(owner: str, repo: str) -> tuple[bool, list[str]]:
+        user = (username_map or {}).get(f"{owner}/{repo}", "")
+        has = _github.user_has_commits(owner, repo, user) if user else False
+        tags = _github.list_tags(owner, repo)
+        return has, tags
+    return probe
+
+
+def _debug_factory(verbose: bool, quiet: bool):
+    """Return a stderr debug-print helper (or no-op when quiet/not verbose)."""
+    if quiet or not verbose:
+        return lambda _msg: None
+    def _debug(msg: str) -> None:
+        click.echo(f"[debug] {msg}", err=True)
+    return _debug
+
+
+# ── Root group ──────────────────────────────────────────────────────
+
+
+@click.group(context_settings={"help_option_names": ["-h", "--help"]})
+@click.version_option(version=__version__, prog_name="pipeline_watch")
+@click.option(
+    "--baseline-db",
+    metavar="PATH",
+    default=None,
+    help=(
+        "Path to the baseline SQLite file. Defaults to "
+        "``.pipeline-watch/baseline.db`` when that directory exists at "
+        "cwd, otherwise ``~/.pipeline-watch/baseline.db``."
+    ),
+)
+@click.option(
+    "--verbose", "-v", is_flag=True, default=False,
+    help="Emit [debug] lines to stderr.",
+)
+@click.option(
+    "--quiet", "-q", is_flag=True, default=False,
+    help="Suppress all stderr output. Exit code still reflects the gate outcome.",
+)
+@click.pass_context
+def cli(ctx: click.Context, baseline_db: str | None, verbose: bool, quiet: bool) -> None:
+    """pipeline-watch — runtime behavioural detection for supply-chain anomalies.
+
+    Companion to pipeline-check. Maintains a per-project SQLite
+    baseline of package / CI-run / VCS-event state; each scan flags
+    deviations from that baseline as findings in a format compatible
+    with pipeline-check's output.
+    """
+    ctx.ensure_object(dict)
+    ctx.obj["baseline_db"] = _resolve_baseline_path(baseline_db)
+    ctx.obj["verbose"] = verbose and not quiet
+    ctx.obj["quiet"] = quiet
+
+
+# ── baseline <subcommand> ───────────────────────────────────────────
+
+
+@cli.group()
+def baseline() -> None:
+    """Inspect and manage the pipeline-watch baseline database."""
+
+
+@baseline.command("init")
+@click.option("--manifest", required=True, metavar="PATH",
+              help="Path to the dependency manifest (e.g. requirements.txt).")
+@click.option("--ecosystem",
+              type=click.Choice(["pypi", "npm"], case_sensitive=False),
+              default="pypi", show_default=True,
+              help="Package ecosystem of the manifest.")
+@click.pass_context
+def baseline_init(ctx: click.Context, manifest: str, ecosystem: str) -> None:
+    """Populate the baseline from a manifest without emitting findings.
+
+    Run this once per project before scanning — establishes what
+    "normal" looks like for every listed package. Later ``scan deps``
+    invocations compare against these snapshots.
+    """
+    ecosystem = ecosystem.lower()
+    if ecosystem != "pypi":
+        raise click.UsageError(
+            "Only --ecosystem pypi is implemented in this release. "
+            "npm support arrives with Module 1b."
+        )
+    if not os.path.isfile(manifest):
+        raise click.UsageError(f"--manifest file not found: {manifest}")
+
+    debug = _debug_factory(ctx.obj["verbose"], ctx.obj["quiet"])
+    entries = _supply.parse_requirements_txt(manifest)
+    debug(f"parsed {len(entries)} entries from {manifest}")
+    if not entries:
+        click.echo(f"[init] {manifest} contained no packages.", err=True)
+        return
+
+    path = ctx.obj["baseline_db"]
+    debug(f"opening baseline at {path}")
+    try:
+        with Store.open(path) as store:
+            result = _supply.scan(store, entries, mode="init")
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        click.echo(f"[error] baseline init failed: {exc}", err=True)
+        click.echo(traceback.format_exc(), err=True, nl=False)
+        sys.exit(2)
+
+    if not ctx.obj["quiet"]:
+        click.echo(
+            f"[init] recorded {result.snapshots_recorded} snapshot(s) "
+            f"into {path}.", err=True,
+        )
+        if result.packages_missing_from_registry:
+            click.echo(
+                f"[init] {len(result.packages_missing_from_registry)} "
+                f"package(s) not found on {ecosystem}: "
+                f"{', '.join(result.packages_missing_from_registry)}",
+                err=True,
+            )
+
+
+@baseline.command("show")
+@click.option("--package", "package_name", metavar="NAME", default=None,
+              help="Show the most recent snapshot for this package.")
+@click.option("--ecosystem",
+              type=click.Choice(["pypi", "npm"], case_sensitive=False),
+              default="pypi", show_default=True)
+@click.pass_context
+def baseline_show(ctx: click.Context, package_name: str | None, ecosystem: str) -> None:
+    """Render the latest snapshot(s) from the baseline."""
+    console = Console()
+    path = ctx.obj["baseline_db"]
+    with Store.open(path) as store:
+        if package_name:
+            snap = store.latest_snapshot(ecosystem.lower(), package_name)
+            if snap is None:
+                click.echo(
+                    f"[show] no snapshot for {ecosystem}:{package_name}. "
+                    f"Run 'pipeline_watch baseline init' first.",
+                    err=True,
+                )
+                sys.exit(3)
+            _render_snapshot(console, snap)
+            return
+        pairs = store.all_packages(ecosystem.lower())
+        if not pairs:
+            click.echo(
+                f"[show] the baseline has no {ecosystem} packages yet. "
+                f"Run 'pipeline_watch baseline init' first.",
+                err=True,
+            )
+            sys.exit(3)
+        table = Table(title=f"Baseline — {ecosystem} packages", box=box.SIMPLE_HEAD)
+        table.add_column("Package", style="bold")
+        table.add_column("Latest version")
+        table.add_column("Recorded at", style="dim")
+        for eco, pkg in pairs:
+            snap = store.latest_snapshot(eco, pkg)
+            if snap:
+                table.add_row(pkg, snap.version, snap.recorded_at)
+        console.print(table)
+
+
+def _render_snapshot(console: Console, snap) -> None:
+    table = Table(title=f"{snap.package} @ {snap.version}", box=box.SIMPLE_HEAD)
+    table.add_column("Field", style="bold")
+    table.add_column("Value")
+    table.add_row("ecosystem", snap.ecosystem)
+    table.add_row("recorded_at", snap.recorded_at)
+    table.add_row("release_hour (UTC)",
+                  "-" if snap.release_hour is None else f"{snap.release_hour:02d}")
+    table.add_row("release_weekday",
+                  "-" if snap.release_weekday is None else str(snap.release_weekday))
+    table.add_row("has_install_script", str(snap.has_install_script))
+    table.add_row("install_script_hash", snap.install_script_hash or "-")
+    maintainer_names = ", ".join(m.get("name", "") for m in snap.maintainers) or "-"
+    table.add_row("maintainers", maintainer_names)
+    deps = ", ".join(f"{k}{v}" for k, v in snap.dependencies.items()) or "-"
+    table.add_row("dependencies", deps)
+    console.print(table)
+
+
+@baseline.command("reset")
+@click.option("--scope", required=True, metavar="SCOPE",
+              help="Scope to reset: 'package:NAME', 'job:REPO:JOB', or 'org:NAME'.")
+@click.pass_context
+def baseline_reset(ctx: click.Context, scope: str) -> None:
+    """Delete every record for *scope* from the baseline."""
+    path = ctx.obj["baseline_db"]
+    with Store.open(path) as store:
+        try:
+            n = store.reset_scope(scope)
+        except ValueError as exc:
+            raise click.UsageError(str(exc)) from exc
+    click.echo(f"[reset] removed {n} row(s) for scope {scope}.", err=True)
+
+
+@baseline.command("stats")
+@click.pass_context
+def baseline_stats(ctx: click.Context) -> None:
+    """Show every precomputed statistic pipeline-watch knows about."""
+    console = Console()
+    path = ctx.obj["baseline_db"]
+    with Store.open(path) as store:
+        rows = store.all_stats()
+    if not rows:
+        click.echo("[stats] baseline has no precomputed stats yet.", err=True)
+        return
+    table = Table(title="Baseline statistics", box=box.SIMPLE_HEAD)
+    table.add_column("Scope", style="bold")
+    table.add_column("Metric")
+    table.add_column("Mean", justify="right")
+    table.add_column("Stddev", justify="right")
+    table.add_column("N", justify="right")
+    table.add_column("Updated", style="dim")
+    for r in rows:
+        table.add_row(
+            r["scope"], r["metric"],
+            f"{r['mean']:.2f}" if r["mean"] is not None else "-",
+            f"{r['stddev']:.2f}" if r["stddev"] is not None else "-",
+            str(r["sample_count"] or 0),
+            str(r["last_updated"]),
+        )
+    console.print(table)
+
+
+# ── scan <subcommand> ───────────────────────────────────────────────
+
+
+@cli.group()
+def scan() -> None:
+    """Detect behavioural deviations from the baseline."""
+
+
+@scan.command("deps")
+@click.option("--manifest", required=True, metavar="PATH",
+              help="Path to the dependency manifest (e.g. requirements.txt).")
+@click.option("--ecosystem",
+              type=click.Choice(["pypi", "npm"], case_sensitive=False),
+              default="pypi", show_default=True)
+@click.option("--output", "-o",
+              type=click.Choice(["terminal", "json", "both"], case_sensitive=False),
+              default="terminal", show_default=True,
+              help="Output format.")
+@click.option("--output-file", "-O", metavar="PATH", default=None,
+              help="Write the JSON report to this path. Implies --output json when unset.")
+@click.option("--fail-on",
+              type=click.Choice(["CRITICAL", "HIGH", "MEDIUM", "LOW"], case_sensitive=False),
+              default="HIGH", show_default=True,
+              help="Exit 1 when any finding is at or above this severity.")
+@click.option("--no-github", is_flag=True, default=False,
+              help="Skip GitHub API calls — SC-001/SC-003 confidence drops to MEDIUM.")
+@click.option("--no-npm", is_flag=True, default=False,
+              help="Skip npm registry calls — disables SC-008.")
+@click.pass_context
+def scan_deps(
+    ctx: click.Context, manifest: str, ecosystem: str,
+    output: str, output_file: str | None,
+    fail_on: str, no_github: bool, no_npm: bool,
+) -> None:
+    """Scan a dependency manifest against the baseline.
+
+    First run needs ``pipeline_watch baseline init`` to establish a
+    starting point. Subsequent runs diff PyPI's current view against
+    the stored snapshot and emit findings.
+    """
+    ecosystem = ecosystem.lower()
+    if ecosystem != "pypi":
+        raise click.UsageError(
+            "Only --ecosystem pypi is implemented in this release."
+        )
+    if not os.path.isfile(manifest):
+        raise click.UsageError(f"--manifest file not found: {manifest}")
+
+    debug = _debug_factory(ctx.obj["verbose"], ctx.obj["quiet"])
+    entries = _supply.parse_requirements_txt(manifest)
+    debug(f"parsed {len(entries)} entries from {manifest}")
+
+    path = ctx.obj["baseline_db"]
+    debug(f"opening baseline at {path}")
+    github_probe = None if no_github else _github_probe_factory(True)
+    npm_probe = None if no_npm else _npm_probe_factory(True)
+
+    try:
+        with Store.open(path) as store:
+            # When the baseline is empty, surface that clearly rather
+            # than silently emitting no findings (and misleading the
+            # operator into thinking all is well).
+            if not store.all_packages("pypi") and not ctx.obj["quiet"]:
+                click.echo(
+                    "[scan] baseline is empty; treating this run as a fresh init. "
+                    "Re-run after a real release to see findings.",
+                    err=True,
+                )
+                mode = "init"
+            else:
+                mode = "scan"
+            result = _supply.scan(
+                store, entries,
+                github_probe=github_probe, npm_probe=npm_probe, mode=mode,
+            )
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        click.echo(f"[error] scan failed: {exc}", err=True)
+        click.echo(traceback.format_exc(), err=True, nl=False)
+        sys.exit(2)
+
+    if result.packages_missing_from_registry and not ctx.obj["quiet"]:
+        click.echo(
+            f"[scan] {len(result.packages_missing_from_registry)} package(s) "
+            f"not found on {ecosystem}: "
+            f"{', '.join(result.packages_missing_from_registry)}",
+            err=True,
+        )
+
+    score = score_from_findings(result.findings)
+
+    # Output — terminal goes to stdout unless JSON is also being produced,
+    # in which case the terminal goes to stderr so stdout stays parseable.
+    json_text = report_json(
+        result.findings, tool_version=__version__, module="supply-chain",
+    )
+
+    if output in ("terminal", "both") and not ctx.obj["quiet"]:
+        stderr_console = output == "both"
+        console = Console(stderr=stderr_console)
+        report_terminal(result.findings, score, console=console)
+    if output in ("json", "both") or output_file:
+        if output_file:
+            Path(output_file).write_text(json_text, encoding="utf-8")
+            if not ctx.obj["quiet"]:
+                click.echo(f"[scan] JSON report written to {output_file}", err=True)
+        elif output in ("json", "both"):
+            click.echo(json_text)
+
+    # Gate — exit 1 when any finding meets or exceeds --fail-on severity.
+    threshold = Severity(fail_on.upper())
+    from .output.schema import severity_rank
+    th_rank = severity_rank(threshold)
+    gating = [f for f in result.findings if severity_rank(f.severity) >= th_rank]
+    if gating:
+        if not ctx.obj["quiet"]:
+            click.echo(
+                f"[gate] FAIL — {len(gating)} finding(s) at or above {fail_on}. "
+                f"Grade {score['grade']}.",
+                err=True,
+            )
+        sys.exit(1)
+    if not ctx.obj["quiet"]:
+        click.echo(
+            f"[gate] PASS — {len(result.findings)} finding(s), grade {score['grade']}.",
+            err=True,
+        )
+
+
+@scan.command("all")
+@click.option("--manifest", required=True, metavar="PATH")
+@click.option("--ecosystem",
+              type=click.Choice(["pypi", "npm"], case_sensitive=False),
+              default="pypi", show_default=True)
+@click.option("--output-file", "-O", default="findings.json", show_default=True,
+              metavar="PATH")
+@click.option("--fail-on",
+              type=click.Choice(["CRITICAL", "HIGH", "MEDIUM", "LOW"], case_sensitive=False),
+              default="HIGH", show_default=True)
+@click.pass_context
+def scan_all(
+    ctx: click.Context, manifest: str, ecosystem: str,
+    output_file: str, fail_on: str,
+) -> None:
+    """Run every implemented module and write a consolidated report.
+
+    Currently this runs the supply-chain module only — ci-runtime and
+    vcs-audit come online in Modules 2 and 3 and will extend this
+    command without any CLI shape change.
+    """
+    ctx.invoke(
+        scan_deps,
+        manifest=manifest,
+        ecosystem=ecosystem,
+        output="json",
+        output_file=output_file,
+        fail_on=fail_on,
+        no_github=False,
+        no_npm=False,
+    )
+
+
+def main() -> None:
+    cli()
+
+
+if __name__ == "__main__":
+    main()

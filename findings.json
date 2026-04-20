@@ -1,0 +1,173 @@
+{
+  "schema_version": "1.0",
+  "tool": "pipeline-watch",
+  "tool_version": "0.1.0",
+  "module": "supply-chain",
+  "score": {
+    "grade": "D",
+    "summary": {
+      "CRITICAL": {
+        "count": 0
+      },
+      "HIGH": {
+        "count": 3
+      },
+      "MEDIUM": {
+        "count": 3
+      },
+      "LOW": {
+        "count": 2
+      }
+    },
+    "total": 8
+  },
+  "findings": [
+    {
+      "tool": "pipeline-watch",
+      "module": "supply-chain",
+      "severity": "HIGH",
+      "score": "D",
+      "signal": "New maintainer 'mallory' published requests 2.32.0.",
+      "baseline": "Previous maintainers for requests: alice.",
+      "evidence": {
+        "package": "requests",
+        "version": "2.32.0",
+        "new_maintainer": "mallory",
+        "new_maintainer_email": "m@bad.example",
+        "has_commits_in_source_repo": false,
+        "source_repo": "https://github.com/psf/requests"
+      },
+      "timestamp": "2026-04-20T12:00:00+00:00",
+      "remediation": "Freeze the dependency and verify the maintainer addition was announced upstream. Rotate any long-lived credentials the package ran against.",
+      "check_id": "SC-001"
+    },
+    {
+      "tool": "pipeline-watch",
+      "module": "supply-chain",
+      "severity": "MEDIUM",
+      "score": "C",
+      "signal": "requests 2.32.0 was published at hour 03Z, outside the maintainer's historical window.",
+      "baseline": "Historical 90% window for requests: hours 14Z\u201316Z across 10 prior releases.",
+      "evidence": {
+        "package": "requests",
+        "version": "2.32.0",
+        "release_hour_utc": 3,
+        "historical_window_low": 14.0,
+        "historical_window_high": 16.0,
+        "sample_count": 10
+      },
+      "timestamp": "2026-04-20T12:00:00+00:00",
+      "remediation": "Contact the maintainer out-of-band to confirm the release timing \u2014 legitimate maintainers rarely break their own circadian pattern without notice.",
+      "check_id": "SC-002"
+    },
+    {
+      "tool": "pipeline-watch",
+      "module": "supply-chain",
+      "severity": "HIGH",
+      "score": "D",
+      "signal": "requests 2.32.0 was published to PyPI but no matching tag exists in https://github.com/psf/requests.",
+      "baseline": "Recent tags in source repo: v2.30.0, v2.31.0",
+      "evidence": {
+        "package": "requests",
+        "version": "2.32.0",
+        "source_repo": "https://github.com/psf/requests",
+        "tried_tags": [
+          "2.32.0",
+          "requests-2.32.0",
+          "requests/2.32.0",
+          "v2.32.0"
+        ]
+      },
+      "timestamp": "2026-04-20T12:00:00+00:00",
+      "remediation": "Publishing without tagging is the signature of a compromised registry credential. Pin away from this version, open an issue upstream, and preserve the sdist for incident response.",
+      "check_id": "SC-003"
+    },
+    {
+      "tool": "pipeline-watch",
+      "module": "supply-chain",
+      "severity": "MEDIUM",
+      "score": "C",
+      "signal": "requests 2.32.0 modified its install-script content; the hash differs from the previous release.",
+      "baseline": "Previous snapshot (2.31.0): has install script, hash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "evidence": {
+        "package": "requests",
+        "previous_version": "2.31.0",
+        "current_version": "2.32.0",
+        "previous_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "current_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "timestamp": "2026-04-20T12:00:00+00:00",
+      "remediation": "Review the diff of setup.py / __init__.py between the two sdists. Install-script additions are the signature of the event-stream and ctx-typosquat compromises.",
+      "check_id": "SC-004"
+    },
+    {
+      "tool": "pipeline-watch",
+      "module": "supply-chain",
+      "severity": "LOW",
+      "score": "B",
+      "signal": "requests 2.32.0 pulled in new dependencies: evilmod.",
+      "baseline": "Previous requests dependencies: urllib3",
+      "evidence": {
+        "package": "requests",
+        "version": "2.32.0",
+        "new_dependencies": [
+          "evilmod"
+        ],
+        "previous_dependencies": [
+          "urllib3"
+        ]
+      },
+      "timestamp": "2026-04-20T12:00:00+00:00",
+      "remediation": "A new transitive dependency is not automatically malicious, but verify the release notes explain it. Run this package through pipeline-check against the new dep's source tree.",
+      "check_id": "SC-005"
+    },
+    {
+      "tool": "pipeline-watch",
+      "module": "supply-chain",
+      "severity": "LOW",
+      "score": "B",
+      "signal": "requests constraint relaxed from '==2.31.0' to '>=2.31'.",
+      "baseline": "Previous manifest pin: ==2.31.0",
+      "evidence": {
+        "package": "requests",
+        "previous_constraint": "==2.31.0",
+        "current_constraint": ">=2.31"
+      },
+      "timestamp": "2026-04-20T12:00:00+00:00",
+      "remediation": "Re-pin the dependency. Floating constraints let a compromised upstream release ship unreviewed into every fresh install.",
+      "check_id": "SC-006"
+    },
+    {
+      "tool": "pipeline-watch",
+      "module": "supply-chain",
+      "severity": "HIGH",
+      "score": "D",
+      "signal": "Manifest packages 'requests' and 'reqeusts' differ by only 2 character(s) \u2014 possible typosquat.",
+      "baseline": "Typosquat campaigns publish names one or two edits away from popular packages (Levenshtein \u2264 2).",
+      "evidence": {
+        "package_a": "requests",
+        "package_b": "reqeusts",
+        "levenshtein_distance": 2
+      },
+      "timestamp": "2026-04-20T12:00:00+00:00",
+      "remediation": "Verify one of the two names isn't a transitive typosquat. Drop whichever was pulled in most recently until you confirm provenance.",
+      "check_id": "SC-007"
+    },
+    {
+      "tool": "pipeline-watch",
+      "module": "supply-chain",
+      "severity": "MEDIUM",
+      "score": "C",
+      "signal": "A package named 'requests' was registered on npm 10 day(s) ago \u2014 matching a PyPI name in your manifest.",
+      "baseline": "Cross-ecosystem collisions registered within the last 30 days are a known dependency-confusion vector.",
+      "evidence": {
+        "package": "requests",
+        "npm_registered": "2026-04-10T12:00:00+00:00",
+        "window_days": 30
+      },
+      "timestamp": "2026-04-20T12:00:00+00:00",
+      "remediation": "Register the same name defensively on the other ecosystem, or add a resolver pin to prevent a package-manager lookup from silently switching ecosystems.",
+      "check_id": "SC-008"
+    }
+  ]
+}

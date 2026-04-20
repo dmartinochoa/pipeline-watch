@@ -73,3 +73,11 @@ desktop.ini
 /.agents/
 /CLAUDE.md
 /skills-lock.json
+
+# ─── pipeline-watch baseline (never commit — contains historical
+#     observations, may reveal release cadence / maintainer patterns) ────
+baseline.db
+baseline.db-journal
+baseline.db-wal
+baseline.db-shm
+/.pipeline-watch/baseline.db*

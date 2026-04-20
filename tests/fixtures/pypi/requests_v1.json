@@ -1,0 +1,42 @@
+{
+  "info": {
+    "name": "requests",
+    "version": "2.31.0",
+    "author": "Kenneth Reitz",
+    "author_email": "me@kennethreitz.org",
+    "maintainer": "",
+    "maintainer_email": "",
+    "project_urls": {
+      "Homepage": "https://requests.readthedocs.io",
+      "Source": "https://github.com/psf/requests"
+    },
+    "requires_dist": [
+      "charset-normalizer (<4,>=2)",
+      "idna (<4,>=2.5)",
+      "urllib3 (<3,>=1.21.1)",
+      "certifi (>=2017.4.17)",
+      "PySocks (!=1.5.7,>=1.5.6) ; extra == 'socks'"
+    ]
+  },
+  "releases": {
+    "2.30.0": [
+      {
+        "packagetype": "sdist",
+        "url": "https://files.pythonhosted.org/packages/abc/requests-2.30.0.tar.gz",
+        "upload_time_iso_8601": "2023-05-03T14:10:00Z"
+      }
+    ],
+    "2.31.0": [
+      {
+        "packagetype": "sdist",
+        "url": "https://files.pythonhosted.org/packages/def/requests-2.31.0.tar.gz",
+        "upload_time_iso_8601": "2023-05-22T14:30:00Z"
+      },
+      {
+        "packagetype": "bdist_wheel",
+        "url": "https://files.pythonhosted.org/packages/def/requests-2.31.0-py3-none-any.whl",
+        "upload_time_iso_8601": "2023-05-22T14:31:00Z"
+      }
+    ]
+  }
+}
