@@ -13,9 +13,12 @@ from pipeline_watch.baseline.store import (
 
 
 @pytest.fixture
-def store() -> Store:
-    conn = sqlite3.connect(":memory:")
-    return Store(conn)
+def store():
+    s = Store(sqlite3.connect(":memory:"))
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 def _snap(**overrides) -> PackageSnapshot:

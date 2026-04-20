@@ -28,9 +28,13 @@ def fixture_loader():
 
 
 @pytest.fixture
-def store() -> Store:
+def store():
     """Fresh in-memory Store per test — no filesystem side effects."""
-    return Store(sqlite3.connect(":memory:"))
+    s = Store(sqlite3.connect(":memory:"))
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 class FakePyPIFetcher:
