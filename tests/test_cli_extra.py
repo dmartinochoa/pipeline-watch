@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 from pipeline_watch.cli import cli
@@ -453,39 +454,33 @@ def test_npm_scan_init_and_diff(tmp_path: Path) -> None:
 # ── Usability: ecosystem inference ──────────────────────────────────
 
 
-def test_cli_infers_pypi_from_requirements_txt(tmp_path: Path) -> None:
-    runner, manifest, baseline_db = _install_runner(tmp_path)
-    try:
-        # No --ecosystem: should infer pypi from the filename.
-        r = runner.invoke(cli, [
-            "--baseline-db", str(baseline_db),
-            "baseline", "init",
-            "--manifest", str(manifest),
-        ], catch_exceptions=False)
-        assert r.exit_code == 0, r.output
-    finally:
-        _pypi.set_fetcher(None)
-        _npm.set_fetcher(None)
-
-
-def test_cli_infers_npm_from_package_json(tmp_path: Path) -> None:
+@pytest.mark.parametrize("filename,ecosystem,content", [
+    # requirements-style → pypi
+    ("requirements.txt", "pypi", "requests==2.31.0\n"),
+    ("requirements-dev.txt", "pypi", "requests==2.31.0\n"),
+    # package.json → npm
+    ("package.json", "npm", '{"dependencies": {}}'),
+])
+def test_cli_infers_ecosystem_from_manifest_filename(
+    tmp_path: Path, filename: str, ecosystem: str, content: str,
+) -> None:
+    """Ecosystem is picked from the filename; explicit flag still wins elsewhere."""
     runner = CliRunner()
-    pkg_json = tmp_path / "package.json"
-    pkg_json.write_text(json.dumps({"dependencies": {}}), encoding="utf-8")
+    manifest = tmp_path / filename
+    manifest.write_text(content, encoding="utf-8")
     baseline_db = tmp_path / "baseline.db"
-    # npm fetcher never hit (empty deps) but disable anyway.
-    _npm.set_fetcher(lambda url, timeout: b"{}")
-    try:
-        r = runner.invoke(cli, [
-            "--baseline-db", str(baseline_db),
-            "baseline", "init",
-            "--manifest", str(pkg_json),
-        ], catch_exceptions=False)
-        # Empty manifest short-circuits before any scan; what we care
-        # about is ecosystem was inferred without raising.
-        assert r.exit_code == 0, r.output
-    finally:
-        _npm.set_fetcher(None)
+
+    if ecosystem == "pypi":
+        _route_pypi({PYPI_JSON_URL.format(package="requests"): _pypi_doc()})
+    else:
+        _npm.set_fetcher(lambda url, timeout: b"{}")
+
+    r = runner.invoke(cli, [
+        "--baseline-db", str(baseline_db),
+        "baseline", "init",
+        "--manifest", str(manifest),
+    ], catch_exceptions=False)
+    assert r.exit_code == 0, r.output
 
 
 def test_cli_unknown_manifest_name_errors(tmp_path: Path) -> None:
@@ -767,6 +762,181 @@ def test_cli_baseline_diff_reports_no_changes(tmp_path: Path) -> None:
         ], catch_exceptions=False)
         assert r.exit_code == 0
         assert "No differences" in r.output
+    finally:
+        _pypi.set_fetcher(None)
+        _npm.set_fetcher(None)
+
+
+# ── HTML output ─────────────────────────────────────────────────────
+
+
+def test_cli_html_output_is_self_contained(tmp_path: Path) -> None:
+    runner, manifest, baseline_db = _install_runner(tmp_path)
+    out = tmp_path / "report.html"
+    try:
+        runner.invoke(cli, [
+            "--baseline-db", str(baseline_db),
+            "baseline", "init", "--manifest", str(manifest),
+        ], catch_exceptions=False)
+        _route_pypi({PYPI_JSON_URL.format(package="requests"): _doc_with_new_maintainer("2.32.0")})
+
+        r = runner.invoke(cli, [
+            "--baseline-db", str(baseline_db),
+            "scan", "deps", "--manifest", str(manifest),
+            "--output", "html", "--output-file", str(out),
+            "--no-github", "--no-cross-ecosystem",
+        ], catch_exceptions=False)
+        assert r.exit_code == 0
+        text = out.read_text(encoding="utf-8")
+        assert text.startswith("<!DOCTYPE html>"), (
+            "HTML report must start with a valid doctype for browsers to "
+            f"render in standards mode; got: {text[:80]!r}"
+        )
+        assert "pipeline-watch report" in text
+        assert "SC-001" in text, (
+            "SC-001 finding should be rendered in the HTML body"
+        )
+        # Strict isolation: the report must be self-contained.
+        # No <script>, no remote stylesheets, no external asset refs.
+        assert "<script" not in text, "report must not embed JavaScript"
+        assert "src=" not in text, "report must not reference external assets"
+        assert "href=" not in text, "report must not link external CSS"
+    finally:
+        _pypi.set_fetcher(None)
+        _npm.set_fetcher(None)
+
+
+def test_cli_output_file_dash_writes_to_stdout(tmp_path: Path) -> None:
+    runner, manifest, baseline_db = _install_runner(tmp_path)
+    try:
+        runner.invoke(cli, [
+            "--baseline-db", str(baseline_db),
+            "baseline", "init", "--manifest", str(manifest),
+        ], catch_exceptions=False)
+        r = runner.invoke(cli, [
+            "--baseline-db", str(baseline_db),
+            "scan", "deps", "--manifest", str(manifest),
+            "--output", "json", "--output-file", "-",
+            "--no-github", "--no-cross-ecosystem",
+        ], catch_exceptions=False)
+        assert r.exit_code == 0
+        # Stronger than "schema_version in output": pull out the JSON
+        # object and validate the envelope shape. Mixing stderr noise
+        # into r.output means we can't parse the whole thing, but we
+        # can extract the top-level object by bracket-matching.
+        start = r.output.index("{")
+        depth = 0
+        end = start
+        for i, ch in enumerate(r.output[start:], start=start):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        payload = json.loads(r.output[start:end])
+        assert payload["schema_version"] == "1.0"
+        assert payload["tool"] == "pipeline-watch"
+        assert "findings" in payload and isinstance(payload["findings"], list)
+    finally:
+        _pypi.set_fetcher(None)
+        _npm.set_fetcher(None)
+
+
+# ── ingest command ──────────────────────────────────────────────────
+
+
+def test_cli_ingest_merges_and_dedupes(tmp_path: Path) -> None:
+    runner = CliRunner()
+    a = tmp_path / "a.json"
+    b = tmp_path / "b.json"
+    base_finding = {
+        "tool": "pipeline-watch", "module": "supply-chain",
+        "severity": "HIGH", "score": "D",
+        "signal": "maintainer changed", "baseline": "prior set",
+        "evidence": {"package": "requests"},
+        "timestamp": "2026-04-20T00:00:00+00:00",
+        "remediation": "confirm",
+        "check_id": "SC-001",
+    }
+    a.write_text(json.dumps({"findings": [base_finding]}), encoding="utf-8")
+    # Same finding in b (dedup), plus a distinct one.
+    b.write_text(json.dumps({
+        "findings": [
+            base_finding,
+            {**base_finding, "check_id": "SC-004",
+             "signal": "install hash flipped"},
+        ],
+    }), encoding="utf-8")
+    out = tmp_path / "merged.json"
+    r = runner.invoke(cli, [
+        "ingest", str(a), str(b),
+        "--output", "json", "--output-file", str(out),
+        "--fail-on", "CRITICAL",
+    ], catch_exceptions=False)
+    assert r.exit_code == 0
+    payload = json.loads(out.read_text())
+    ids = [f["check_id"] for f in payload["findings"]]
+    assert sorted(ids) == ["SC-001", "SC-004"]
+
+
+def test_cli_ingest_gates_on_severity(tmp_path: Path) -> None:
+    runner = CliRunner()
+    a = tmp_path / "a.json"
+    a.write_text(json.dumps({"findings": [{
+        "tool": "pipeline-watch", "module": "supply-chain",
+        "severity": "HIGH", "score": "D",
+        "signal": "x", "baseline": "y",
+        "evidence": {"package": "requests"},
+        "timestamp": "2026-04-20T00:00:00+00:00",
+        "remediation": "z",
+        "check_id": "SC-001",
+    }]}), encoding="utf-8")
+    r = runner.invoke(cli, [
+        "ingest", str(a), "--output", "json", "--output-file", "-",
+        "--fail-on", "HIGH",
+    ], catch_exceptions=False)
+    assert r.exit_code == 1
+
+
+def test_cli_ingest_rejects_malformed_json(tmp_path: Path) -> None:
+    runner = CliRunner()
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json", encoding="utf-8")
+    r = runner.invoke(cli, ["ingest", str(bad)], catch_exceptions=False)
+    assert r.exit_code == 2
+    assert "not valid JSON" in r.output
+
+
+# ── doctor command ──────────────────────────────────────────────────
+
+
+def test_cli_doctor_reports_on_empty_baseline(tmp_path: Path) -> None:
+    runner = CliRunner()
+    r = runner.invoke(cli, [
+        "--baseline-db", str(tmp_path / "baseline.db"),
+        "doctor",
+    ], catch_exceptions=False)
+    assert r.exit_code == 0
+    assert "pipeline-watch version" in r.output
+    assert "baseline path" in r.output
+
+
+def test_cli_doctor_reports_on_populated_baseline(tmp_path: Path) -> None:
+    runner, manifest, baseline_db = _install_runner(tmp_path)
+    try:
+        runner.invoke(cli, [
+            "--baseline-db", str(baseline_db),
+            "baseline", "init", "--manifest", str(manifest),
+        ], catch_exceptions=False)
+        r = runner.invoke(cli, [
+            "--baseline-db", str(baseline_db),
+            "doctor",
+        ], catch_exceptions=False)
+        assert r.exit_code == 0
+        assert "schema version" in r.output
+        assert "total packages" in r.output
     finally:
         _pypi.set_fetcher(None)
         _npm.set_fetcher(None)

@@ -22,6 +22,7 @@ single CI step.
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -35,6 +36,7 @@ from . import __version__
 from .baseline.store import Store, default_baseline_path
 from .detectors import supply_chain as _supply
 from .output.formatter import report_json, report_terminal
+from .output.html import to_html
 from .output.sarif import to_sarif
 from .output.schema import Severity, score_from_findings, severity_rank
 from .providers import github as _github
@@ -242,9 +244,10 @@ def baseline_init(ctx: click.Context, manifest: str, ecosystem: str | None) -> N
         with Store.open(path) as store:
             result = _supply.scan(store, entries, ecosystem=ecosystem, mode="init")
     except Exception as exc:  # noqa: BLE001
-        import traceback
         click.echo(f"[error] baseline init failed: {exc}", err=True)
-        click.echo(traceback.format_exc(), err=True, nl=False)
+        if ctx.obj["verbose"]:
+            import traceback
+            click.echo(traceback.format_exc(), err=True, nl=False)
         sys.exit(2)
 
     if not ctx.obj["quiet"]:
@@ -512,7 +515,6 @@ def signals(output: str) -> None:
     """
     catalogue = _supply.SIGNAL_CATALOGUE
     if output == "json":
-        import json
         payload = {
             "schema_version": "1.0",
             "signals": [
@@ -560,10 +562,14 @@ def scan() -> None:
               help="Package ecosystem. Inferred from the manifest filename "
                    "when unset (requirements*.txt → pypi, package.json → npm).")
 @click.option("--output", "-o",
-              type=click.Choice(["terminal", "json", "sarif", "both"], case_sensitive=False),
+              type=click.Choice(
+                  ["terminal", "json", "sarif", "html", "both"],
+                  case_sensitive=False,
+              ),
               default="terminal", show_default=True,
               help="Output format. 'sarif' emits SARIF 2.1.0 for GitHub "
-                   "Code Scanning / Azure DevOps.")
+                   "Code Scanning / Azure DevOps. 'html' emits a "
+                   "self-contained report.")
 @click.option("--output-file", "-O", metavar="PATH", default=None,
               help="Write the structured report to this path. Format tracks --output.")
 @click.option("--fail-on",
@@ -717,12 +723,14 @@ def scan_deps(
 
     # Output — terminal goes to stdout unless structured output is also being
     # produced, in which case the terminal goes to stderr so stdout stays parseable.
-    is_structured = output in ("json", "sarif", "both")
+    is_structured = output in ("json", "sarif", "html", "both")
     structured_text = ""
-    if output == "sarif" or (output_file and output == "sarif"):
+    if output == "sarif":
         structured_text = to_sarif(
             findings, tool_version=__version__, manifest=manifest,
         )
+    elif output == "html":
+        structured_text = to_html(findings, tool_version=__version__)
     elif is_structured or output_file:
         structured_text = report_json(
             findings, tool_version=__version__, module="supply-chain",
@@ -733,10 +741,12 @@ def scan_deps(
         console = Console(stderr=stderr_console)
         report_terminal(findings, score, console=console)
     if is_structured or output_file:
-        if output_file:
+        if output_file == "-":
+            click.echo(structured_text)
+        elif output_file:
             Path(output_file).write_text(structured_text, encoding="utf-8")
             if not ctx.obj["quiet"]:
-                fmt = "SARIF" if output == "sarif" else "JSON"
+                fmt = {"sarif": "SARIF", "html": "HTML"}.get(output, "JSON")
                 click.echo(
                     f"[scan] {fmt} report written to {output_file}", err=True,
                 )
@@ -799,6 +809,159 @@ def scan_all(
         ignore_file=None,
         no_ignore=False,
     )
+
+
+# ── ingest ──────────────────────────────────────────────────────────
+
+
+@cli.command("ingest")
+@click.argument("inputs", nargs=-1, required=True,
+                type=click.Path(exists=True, dir_okay=False))
+@click.option("--output", "-o",
+              type=click.Choice(
+                  ["terminal", "json", "sarif", "html"], case_sensitive=False,
+              ),
+              default="terminal", show_default=True,
+              help="Format for the merged report.")
+@click.option("--output-file", "-O", metavar="PATH", default=None,
+              help="Write the merged report here; '-' writes to stdout.")
+@click.option("--fail-on",
+              type=click.Choice(
+                  ["CRITICAL", "HIGH", "MEDIUM", "LOW"], case_sensitive=False,
+              ),
+              default="HIGH", show_default=True,
+              help="Exit 1 when any merged finding is at or above this severity.")
+@click.pass_context
+def ingest(
+    ctx: click.Context, inputs: tuple[str, ...],
+    output: str, output_file: str | None, fail_on: str,
+) -> None:
+    """Merge one or more pipeline-watch / pipeline-check findings.json files.
+
+    Deduplicates on ``(check_id, signal, evidence.package)`` so the
+    same issue spotted by two runs doesn't double-count in the
+    rollup. The merged envelope carries its own ``score`` so the
+    ``--fail-on`` gate applies across every input uniformly.
+    """
+    from .output.schema import Finding, Module
+    merged: list[Finding] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    for path_str in inputs:
+        try:
+            data = json.loads(Path(path_str).read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise click.UsageError(f"{path_str}: not valid JSON ({exc.msg})") from exc
+        items = data.get("findings", []) if isinstance(data, dict) else []
+        if not isinstance(items, list):
+            raise click.UsageError(f"{path_str}: 'findings' must be a list")
+        for entry in items:
+            try:
+                finding = Finding(
+                    module=Module(entry.get("module", "supply-chain")),
+                    severity=Severity(entry.get("severity", "LOW")),
+                    signal=entry.get("signal", ""),
+                    baseline=entry.get("baseline", ""),
+                    remediation=entry.get("remediation", ""),
+                    evidence=entry.get("evidence", {}) or {},
+                    timestamp=entry.get("timestamp", ""),
+                    check_id=entry.get("check_id", ""),
+                )
+            except (KeyError, ValueError) as exc:
+                raise click.UsageError(
+                    f"{path_str}: malformed finding ({exc})"
+                ) from exc
+            key = (
+                finding.check_id,
+                finding.signal,
+                str(finding.evidence.get("package") or ""),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(finding)
+
+    score = score_from_findings(merged)
+    if output == "json":
+        text = report_json(merged, tool_version=__version__, module=None)
+    elif output == "sarif":
+        text = to_sarif(merged, tool_version=__version__)
+    elif output == "html":
+        text = to_html(merged, tool_version=__version__)
+    else:
+        text = ""
+        report_terminal(merged, score, console=Console())
+
+    if text and output_file == "-":
+        click.echo(text)
+    elif text and output_file:
+        Path(output_file).write_text(text, encoding="utf-8")
+        if not ctx.obj["quiet"]:
+            click.echo(f"[ingest] report written to {output_file}", err=True)
+    elif text:
+        click.echo(text)
+
+    threshold = Severity(fail_on.upper())
+    gating = [f for f in merged if severity_rank(f.severity) >= severity_rank(threshold)]
+    if gating:
+        if not ctx.obj["quiet"]:
+            click.echo(
+                f"[gate] FAIL — {len(gating)} finding(s) at or above {fail_on}.",
+                err=True,
+            )
+        sys.exit(1)
+    if not ctx.obj["quiet"]:
+        click.echo(
+            f"[ingest] merged {len(merged)} finding(s) from "
+            f"{len(inputs)} file(s).", err=True,
+        )
+
+
+# ── doctor ──────────────────────────────────────────────────────────
+
+
+@cli.command("doctor")
+@click.pass_context
+def doctor(ctx: click.Context) -> None:
+    """Print a one-screen diagnostic: paths, schema, package count, version info.
+
+    Intended for bug reports. Copy-paste the output instead of
+    listing five separate commands.
+    """
+    import platform
+    console = Console()
+    path = ctx.obj["baseline_db"]
+    table = Table(title="pipeline-watch doctor", box=box.SIMPLE_HEAD)
+    table.add_column("Key", style="bold")
+    table.add_column("Value")
+    table.add_row("pipeline-watch version", __version__)
+    table.add_row("python", f"{platform.python_version()} ({platform.platform()})")
+    table.add_row("baseline path", str(path))
+    if path.exists():
+        size_kb = path.stat().st_size / 1024.0
+        table.add_row("baseline size", f"{size_kb:,.1f} KB")
+        try:
+            with Store.open(path) as store:
+                table.add_row("schema version", str(store.schema_version()))
+                pairs = store.all_packages()
+                table.add_row("total packages", str(len(pairs)))
+                by_eco: dict[str, int] = {}
+                for eco, _pkg in pairs:
+                    by_eco[eco] = by_eco.get(eco, 0) + 1
+                for eco, n in sorted(by_eco.items()):
+                    table.add_row(f"  {eco}", str(n))
+        except Exception as exc:  # noqa: BLE001
+            table.add_row("baseline error", str(exc))
+    else:
+        table.add_row("baseline", "(does not exist — run baseline init)")
+
+    suppression_path = path.parent / "ignore.json" if path.exists() else None
+    if suppression_path and suppression_path.exists():
+        table.add_row("ignore.json", str(suppression_path))
+    else:
+        table.add_row("ignore.json", "(none)")
+
+    console.print(table)
 
 
 def main() -> None:

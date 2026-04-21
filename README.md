@@ -117,10 +117,26 @@ pipeline_watch scan deps --manifest requirements.txt --skip SC-005,SC-014
 pipeline_watch scan deps --manifest requirements.txt \
     --output sarif --output-file findings.sarif
 
+# Self-contained HTML report — email it to a security team.
+pipeline_watch scan deps --manifest requirements.txt \
+    --output html --output-file report.html
+
+# '-' as --output-file writes to stdout (useful in shell pipelines).
+pipeline_watch scan deps --manifest requirements.txt \
+    --output json --output-file - | jq '.findings[].check_id'
+
 # Accept the current registry state as the new normal — pairs with a
 # re-baseline PR. Without this flag, findings persist across CI runs
 # until a human reviews them (same deviation re-flags next run).
 pipeline_watch scan deps --manifest requirements.txt --baseline-update
+
+# Merge multiple reports into one envelope — dedupes on
+# (check_id, signal, package). Useful in matrix jobs.
+pipeline_watch ingest frontend.json backend.json \
+    --output html --output-file combined.html
+
+# One-command diagnostics for bug reports.
+pipeline_watch doctor
 
 # Quiet mode — stderr silent, exit code still reflects the gate.
 pipeline_watch --quiet scan deps --manifest requirements.txt
@@ -141,7 +157,7 @@ pipeline_watch signals -o json      # machine-readable
 
 ## Signals
 
-Seventeen behavioural checks compare the live registry + manifest against
+Eighteen behavioural checks compare the live registry + manifest against
 the prior snapshot. Every finding ships with the full evidence object
 that triggered it — raw numbers, before/after values, the exact package
 names and versions — so a reviewer can decide without re-running the
@@ -166,6 +182,7 @@ scan.
 | **SC-015** | LOW | Release landed on a weekday the maintainer has never used before | ≥5 prior releases |
 | **SC-016** | MED | Registry advertises a pre-release (alpha/beta/rc/dev) as latest | — (current-state) |
 | **SC-017** | MED | ≥3 releases within 24h when historical cadence is slow | ≥4 prior releases |
+| **SC-020** | HIGH | Maintainer kept the same display name but the email changed | Prior snapshot |
 
 **Confidence downgrades.** When corroborating data is unavailable,
 severity drops rather than the finding disappearing. Example: SC-001
@@ -215,7 +232,7 @@ json` for CI, `terminal` for humans, `both` when you want both.
    │ github        │
    └───────┬───────┘
            ▼
-   ┌───────────────┐    17 pure signal functions over (prev, current)
+   ┌───────────────┐    18 pure signal functions over (prev, current)
    │ Detector      │    snapshots. A per-package loop records the new
    │ supply_chain  │    snapshot, then SC-007/SC-008 run pairwise.
    └───────┬───────┘
@@ -340,6 +357,28 @@ evidence for them.
 | SC-015 | L2 — build integrity | CICD-SEC-5 | A.5.24 |
 | SC-016 | L1 — reproducibility | CICD-SEC-3 | A.8.9 |
 | SC-017 | L2 — build integrity | CICD-SEC-5 | A.5.24 |
+| SC-020 | L3 — provenance | CICD-SEC-4 | A.5.17 · A.5.24 |
+
+---
+
+## pre-commit integration
+
+A `.pre-commit-hooks.yaml` manifest ships with the package, so
+[`pre-commit`](https://pre-commit.com/) users can wire pipeline-watch
+into the same framework they use for `ruff` / `black`:
+
+```yaml
+# .pre-commit-config.yaml
+- repo: https://github.com/dmartinochoa/pipeline-watch
+  rev: v0.1.0
+  hooks:
+    - id: pipeline-watch-scan
+```
+
+`pipeline-watch-scan` runs on every commit touching `requirements*.txt`
+or `package.json`. `pipeline-watch-baseline-init` is `stage: manual` so
+it only runs on `pre-commit run --hook-stage manual
+pipeline-watch-baseline-init` — the explicit re-baseline step.
 
 ---
 
@@ -380,6 +419,22 @@ Rules:
 Bypass the file for one run with `--no-ignore`. Point at an alternate
 file with `--ignore-file PATH`.
 
+A JSON Schema ships at
+[`pipeline_watch/suppressions.schema.json`](pipeline_watch/suppressions.schema.json)
+— point your editor at it for inline validation:
+
+```json
+// .vscode/settings.json
+{
+  "json.schemas": [
+    {
+      "fileMatch": [".pipeline-watch/ignore.json"],
+      "url": "./pipeline_watch/suppressions.schema.json"
+    }
+  ]
+}
+```
+
 ---
 
 ## Troubleshooting
@@ -413,7 +468,7 @@ A typical project sits at a few hundred KB even after a year. Use
 
 ```bash
 make install    # editable install + dev deps
-make test       # pytest — 278 tests, fully offline
+make test       # pytest — 291 tests, fully offline
 make coverage   # pytest + coverage report (min 92%)
 make lint       # ruff
 make type       # mypy

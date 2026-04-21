@@ -15,6 +15,7 @@ from pipeline_watch.detectors.supply_chain import (
     signal_dependency_removed,
     signal_dormant_revival,
     signal_install_script_change,
+    signal_maintainer_email_changed,
     signal_maintainer_removed,
     signal_major_version_jump,
     signal_new_maintainer,
@@ -744,6 +745,96 @@ def test_sc017_skipped_with_insufficient_history() -> None:
 def test_sc017_skipped_when_current_has_no_upload_timestamp() -> None:
     current = _snap(release_uploaded_at="")
     assert signal_release_velocity_spike([], current) == []
+
+
+# ── Edge cases: symmetric coverage backfill ─────────────────────────
+
+
+def test_sc002_just_above_sample_floor_evaluates_window() -> None:
+    """Exactly 3 samples (the minimum) should still be eligible for SC-002."""
+    # All prior releases at hour 14 → 90th-percentile window collapses
+    # around 14. A release at 03:00 is outside that window.
+    prev_hours = [14, 14, 14]
+    current = _snap(release_hour=3)
+    findings = signal_off_hours_release(prev_hours, current)
+    assert len(findings) == 1
+    assert findings[0].check_id == "SC-002"
+
+
+def test_sc002_below_sample_floor_never_fires() -> None:
+    """2 samples is below the 3-sample minimum — no finding even if far off."""
+    assert signal_off_hours_release([14, 14], _snap(release_hour=3)) == []
+
+
+def test_sc005_skips_when_prev_has_no_dependencies() -> None:
+    """An empty prior dependency set is a legitimate baseline (e.g. a
+    package that never declared deps). Every current dep would look
+    'new'; SC-005 should still fire since the deps really are new, but
+    an empty baseline shouldn't cause a KeyError / AttributeError."""
+    prev = _snap(dependencies={})
+    current = _snap(dependencies={"urllib3": ">=1.21.1"})
+    findings = signal_new_transitive_dep(prev, current)
+    assert len(findings) == 1
+    assert findings[0].check_id == "SC-005"
+    assert "urllib3" in findings[0].evidence["new_dependencies"]
+
+
+def test_sc005_skips_when_both_sides_empty() -> None:
+    prev = _snap(dependencies={})
+    current = _snap(dependencies={})
+    assert signal_new_transitive_dep(prev, current) == []
+
+
+def test_sc012_fires_for_npm_with_deprecated_label() -> None:
+    """Ecosystem label switches from 'yanked' (pypi) to 'deprecated' (npm)."""
+    current = _snap(ecosystem="npm", yanked=True)
+    findings = signal_yanked_or_deprecated(current)
+    assert len(findings) == 1
+    assert "deprecated" in findings[0].signal.lower()
+
+
+# ── SC-020 maintainer-email-changed ─────────────────────────────────
+
+
+def test_sc020_fires_when_email_changes_with_same_name() -> None:
+    prev = _snap(maintainers=[{"name": "alice", "email": "alice@old.example"}])
+    current = _snap(maintainers=[{"name": "alice", "email": "alice@new.example"}])
+    findings = signal_maintainer_email_changed(prev, current)
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.check_id == "SC-020"
+    assert f.severity == Severity.HIGH
+    assert f.evidence["changes"][0]["previous_email"] == "alice@old.example"
+    assert f.evidence["changes"][0]["current_email"] == "alice@new.example"
+
+
+def test_sc020_skips_when_email_unchanged() -> None:
+    prev = _snap(maintainers=[{"name": "alice", "email": "alice@example"}])
+    current = _snap(maintainers=[{"name": "alice", "email": "alice@example"}])
+    assert signal_maintainer_email_changed(prev, current) == []
+
+
+def test_sc020_skips_on_new_maintainer_with_new_email() -> None:
+    # mallory appears for the first time — SC-009/SC-001 deal with new
+    # maintainers, SC-020 stays out of it.
+    prev = _snap(maintainers=[{"name": "alice", "email": "alice@example"}])
+    current = _snap(maintainers=[
+        {"name": "alice", "email": "alice@example"},
+        {"name": "mallory", "email": "mallory@bad.example"},
+    ])
+    assert signal_maintainer_email_changed(prev, current) == []
+
+
+def test_sc020_case_insensitive_name_match() -> None:
+    prev = _snap(maintainers=[{"name": "Alice", "email": "alice@old.example"}])
+    current = _snap(maintainers=[{"name": "alice", "email": "alice@new.example"}])
+    findings = signal_maintainer_email_changed(prev, current)
+    assert len(findings) == 1
+
+
+def test_sc020_skipped_without_prior_snapshot() -> None:
+    current = _snap(maintainers=[{"name": "alice", "email": "alice@a"}])
+    assert signal_maintainer_email_changed(None, current) == []
 
 
 def test_sc017_skipped_when_burst_below_threshold() -> None:

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -71,6 +72,8 @@ SIGNAL_CATALOGUE: dict[str, tuple[str, Severity, str]] = {
                "Registry advertises a pre-release (alpha/beta/rc/dev) as latest"),
     "SC-017": ("release-velocity-spike", Severity.MEDIUM,
                "Burst of ≥3 releases in 24h with slow historical cadence"),
+    "SC-020": ("maintainer-email-changed", Severity.HIGH,
+               "A maintainer kept the same display name but the email changed"),
 }
 
 # Backwards-compatible slug-only mapping (legacy callers / tests).
@@ -916,6 +919,72 @@ def signal_prerelease_as_latest(
     )]
 
 
+def signal_maintainer_email_changed(
+    prev: PackageSnapshot | None,
+    current: PackageSnapshot,
+) -> list[Finding]:
+    """SC-020: a maintainer's display name stayed but their email flipped.
+
+    A pure rename (alice@olddomain → alice@newdomain, same display name)
+    is the textbook account-takeover footprint: an attacker who gets
+    publish rights often changes the email to a mailbox they control
+    without touching the visible name, so follow-up notifications land
+    on their side. Benign cases (company moves domain, maintainer
+    marries) exist — hence HIGH, not CRITICAL.
+    """
+    if prev is None:
+        return []
+    prev_by_name: dict[str, str] = {}
+    for m in prev.maintainers:
+        name = str(m.get("name") or "").strip().lower()
+        email = str(m.get("email") or "").strip().lower()
+        if name and email:
+            prev_by_name[name] = email
+    changes: list[dict[str, str]] = []
+    for m in current.maintainers:
+        name = str(m.get("name") or "").strip().lower()
+        email = str(m.get("email") or "").strip().lower()
+        if not name or not email:
+            continue
+        prior = prev_by_name.get(name)
+        if prior and prior != email:
+            changes.append({
+                "maintainer": m.get("name") or "",
+                "previous_email": prior,
+                "current_email": email,
+            })
+    if not changes:
+        return []
+    names = ", ".join(c["maintainer"] for c in changes)
+    return [Finding(
+        check_id="SC-020",
+        module=Module.SUPPLY_CHAIN,
+        severity=Severity.HIGH,
+        signal=(
+            f"{current.package} {current.version}: {len(changes)} maintainer(s) "
+            f"kept their display name but changed email ({names})."
+        ),
+        baseline=(
+            "Prior emails for the same names: "
+            + "; ".join(
+                f"{c['maintainer']} → {c['previous_email']}" for c in changes
+            )
+        ),
+        evidence={
+            "package": current.package,
+            "version": current.version,
+            "changes": changes,
+        },
+        remediation=(
+            "Confirm with the named maintainer out-of-band (not via the "
+            "new email). A silent email flip is a common account-takeover "
+            "footprint — attackers redirect 2FA / recovery mail before "
+            "pushing a poisoned release."
+        ),
+        timestamp=current.recorded_at,
+    )]
+
+
 def signal_release_velocity_spike(
     history: list[tuple[str, str]],
     current: PackageSnapshot,
@@ -1044,6 +1113,7 @@ def scan(
     mode: str = "scan",
     now: datetime | None = None,
     update_baseline: bool = True,
+    fetch_workers: int = 8,
 ) -> ScanResult:
     """Run every signal against *entries* and return findings + side effects.
 
@@ -1078,10 +1148,26 @@ def scan(
     missing: list[str] = []
     skipped_due_to_findings: list[str] = []
 
-    for entry in entries:
-        pkg_info, current = _fetch_current_snapshot(
-            ecosystem, entry, now_iso=now_iso,
-        )
+    # Parallelise the network-bound registry fetches. Signals and
+    # store writes stay on the main thread so stats and per-package
+    # ordering remain deterministic, and SQLite doesn't see concurrent
+    # writers. The workers touch only the injected fetchers which are
+    # already stateless.
+    if len(entries) > 1 and fetch_workers > 1:
+        with ThreadPoolExecutor(max_workers=fetch_workers) as pool:
+            fetched = list(pool.map(
+                lambda e: _fetch_current_snapshot(
+                    ecosystem, e, now_iso=now_iso,
+                ),
+                entries,
+            ))
+    else:
+        fetched = [
+            _fetch_current_snapshot(ecosystem, e, now_iso=now_iso)
+            for e in entries
+        ]
+
+    for entry, (pkg_info, current) in zip(entries, fetched, strict=True):
         if current is None:
             missing.append(entry.name)
             continue
@@ -1106,6 +1192,7 @@ def scan(
             pkg_findings += signal_new_transitive_dep(prev, current)
             pkg_findings += signal_dependency_removed(prev, current)
             pkg_findings += signal_maintainer_removed(prev, current)
+            pkg_findings += signal_maintainer_email_changed(prev, current)
             pkg_findings += signal_version_downgrade(prev, current)
             pkg_findings += signal_major_version_jump(prev, current)
             pkg_findings += signal_dormant_revival(prev, current)

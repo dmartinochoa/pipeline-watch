@@ -1,0 +1,28 @@
+- id: pipeline-watch-scan
+  name: pipeline-watch supply-chain scan
+  description: |
+    Scan the project's dependency manifests for behavioural deviations
+    from the pipeline-watch baseline. Fails the hook when a finding at
+    or above HIGH severity is produced.
+  entry: pipeline_watch scan deps
+  language: python
+  pass_filenames: false
+  args:
+    - --manifest=requirements.txt
+    - --fail-on=HIGH
+  files: ^requirements.*\.txt$|^package\.json$
+  stages: [pre-commit, pre-push]
+
+- id: pipeline-watch-baseline-init
+  name: pipeline-watch baseline init
+  description: |
+    Populate / refresh the pipeline-watch baseline from the manifest
+    without emitting findings. Run this after an intentional dependency
+    bump so the next scan compares against the new "normal".
+  entry: pipeline_watch baseline init
+  language: python
+  pass_filenames: false
+  args:
+    - --manifest=requirements.txt
+  files: ^requirements.*\.txt$|^package\.json$
+  stages: [manual]

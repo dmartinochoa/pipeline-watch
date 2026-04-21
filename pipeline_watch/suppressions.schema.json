@@ -1,0 +1,49 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/dmartinochoa/pipeline-watch/blob/master/pipeline_watch/suppressions.schema.json",
+  "title": "pipeline-watch suppression file",
+  "description": "Per-project policy that silences known-good findings without passing --skip in CI.",
+  "type": "object",
+  "required": ["suppressions"],
+  "properties": {
+    "suppressions": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/suppression" }
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "suppression": {
+      "type": "object",
+      "description": "A single suppression rule. Must specify at least one of 'package' or 'check_id'.",
+      "required": ["reason"],
+      "anyOf": [
+        { "required": ["package"] },
+        { "required": ["check_id"] }
+      ],
+      "properties": {
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Why this finding is being suppressed. Required — silent ignores hide context from auditors."
+        },
+        "package": {
+          "type": "string",
+          "description": "Package name the rule applies to. Omit to match every package."
+        },
+        "check_id": {
+          "type": "string",
+          "pattern": "^SC-\\d{3}$",
+          "description": "SC-XXX identifier the rule applies to. Omit to match every check."
+        },
+        "expires": {
+          "type": "string",
+          "format": "date",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+          "description": "Optional ISO date (YYYY-MM-DD). Past-dated rules are ignored with a warning."
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

@@ -39,6 +39,9 @@ Issues = "https://github.com/dmartinochoa/pipeline-watch/issues"
 [tool.setuptools.packages.find]
 include = ["pipeline_watch*"]
 
+[tool.setuptools.package-data]
+pipeline_watch = ["suppressions.schema.json"]
+
 [tool.ruff]
 target-version = "py310"
 line-length = 120
