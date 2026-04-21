@@ -39,7 +39,8 @@ def _default_fetcher(url: str, timeout: float) -> bytes:
         },
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
-        return resp.read()
+        data: bytes = resp.read()
+        return data
 
 
 _fetcher: _Fetcher = _default_fetcher

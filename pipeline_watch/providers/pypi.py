@@ -42,7 +42,8 @@ def _default_fetcher(url: str, timeout: float) -> bytes:
         headers={"User-Agent": "pipeline-watch/0.1 (+https://github.com/dmartinochoa/pipeline-watch)"},
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - trusted URL schema
-        return resp.read()
+        data: bytes = resp.read()
+        return data
 
 
 _fetcher: _Fetcher = _default_fetcher
@@ -359,12 +360,12 @@ def _probe_install_script(sdist_url: str) -> tuple[bool, str | None, int]:
 
     h = hashlib.sha256()
     total = 0
-    for path, data in sorted(relevant, key=lambda x: x[0]):
+    for path, blob in sorted(relevant, key=lambda x: x[0]):
         h.update(path.encode("utf-8"))
         h.update(b"\0")
-        h.update(data)
+        h.update(blob)
         h.update(b"\0")
-        total += len(data)
+        total += len(blob)
     # "has_install_script" is true when setup.py / setup.cfg /
     # pyproject.toml is present (build hook surface), or when any
     # __init__.py showed up (common trojan vector in event-stream and

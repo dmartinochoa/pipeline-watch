@@ -448,3 +448,426 @@ def test_npm_scan_init_and_diff(tmp_path: Path) -> None:
     finally:
         _npm.set_fetcher(None)
         _pypi.set_fetcher(None)
+
+
+# ── Usability: ecosystem inference ──────────────────────────────────
+
+
+def test_cli_infers_pypi_from_requirements_txt(tmp_path: Path) -> None:
+    runner, manifest, baseline_db = _install_runner(tmp_path)
+    try:
+        # No --ecosystem: should infer pypi from the filename.
+        r = runner.invoke(cli, [
+            "--baseline-db", str(baseline_db),
+            "baseline", "init",
+            "--manifest", str(manifest),
+        ], catch_exceptions=False)
+        assert r.exit_code == 0, r.output
+    finally:
+        _pypi.set_fetcher(None)
+        _npm.set_fetcher(None)
+
+
+def test_cli_infers_npm_from_package_json(tmp_path: Path) -> None:
+    runner = CliRunner()
+    pkg_json = tmp_path / "package.json"
+    pkg_json.write_text(json.dumps({"dependencies": {}}), encoding="utf-8")
+    baseline_db = tmp_path / "baseline.db"
+    # npm fetcher never hit (empty deps) but disable anyway.
+    _npm.set_fetcher(lambda url, timeout: b"{}")
+    try:
+        r = runner.invoke(cli, [
+            "--baseline-db", str(baseline_db),
+            "baseline", "init",
+            "--manifest", str(pkg_json),
+        ], catch_exceptions=False)
+        # Empty manifest short-circuits before any scan; what we care
+        # about is ecosystem was inferred without raising.
+        assert r.exit_code == 0, r.output
+    finally:
+        _npm.set_fetcher(None)
+
+
+def test_cli_unknown_manifest_name_errors(tmp_path: Path) -> None:
+    runner = CliRunner()
+    manifest = tmp_path / "deps.yaml"
+    manifest.write_text("", encoding="utf-8")
+    r = runner.invoke(cli, [
+        "--baseline-db", str(tmp_path / "baseline.db"),
+        "baseline", "init",
+        "--manifest", str(manifest),
+    ], catch_exceptions=False)
+    assert r.exit_code == 2  # click.UsageError
+    assert "could not infer --ecosystem" in r.output
+
+
+# ── Usability: signals subcommand ───────────────────────────────────
+
+
+def test_cli_signals_terminal_lists_every_check() -> None:
+    runner = CliRunner()
+    r = runner.invoke(cli, ["signals"], catch_exceptions=False)
+    assert r.exit_code == 0
+    # Every SC-XXX ID should appear in the listing.
+    from pipeline_watch.detectors.supply_chain import SIGNAL_CATALOGUE
+    for sc_id in SIGNAL_CATALOGUE:
+        assert sc_id in r.output, f"{sc_id} missing from 'signals' output"
+
+
+def test_cli_signals_json_is_parseable() -> None:
+    runner = CliRunner()
+    r = runner.invoke(cli, ["signals", "--output", "json"], catch_exceptions=False)
+    assert r.exit_code == 0
+    payload = json.loads(r.output)
+    assert payload["schema_version"] == "1.0"
+    ids = {s["id"] for s in payload["signals"]}
+    from pipeline_watch.detectors.supply_chain import SIGNAL_CATALOGUE
+    assert ids == set(SIGNAL_CATALOGUE)
+    # Each entry has the required keys.
+    first = payload["signals"][0]
+    assert set(first) == {"id", "slug", "severity", "description"}
+
+
+# ── Usability: --skip filter ────────────────────────────────────────
+
+
+def _doc_with_new_maintainer(version: str) -> dict:
+    return {
+        "info": {
+            "name": "requests", "version": version,
+            "author": "Kenneth Reitz", "author_email": "me@example.com",
+            "maintainer": "mallory", "maintainer_email": "mallory@example.com",
+            "project_urls": {}, "requires_dist": [],
+        },
+        "releases": {version: [{
+            "packagetype": "sdist",
+            "url": f"https://files.pythonhosted.org/packages/z/requests-{version}.tar.gz",
+            "upload_time_iso_8601": "2023-05-22T14:30:00Z",
+        }]},
+    }
+
+
+def test_cli_skip_suppresses_named_check(tmp_path: Path) -> None:
+    runner, manifest, baseline_db = _install_runner(tmp_path)
+    out = tmp_path / "findings.json"
+    try:
+        runner.invoke(cli, [
+            "--baseline-db", str(baseline_db),
+            "baseline", "init", "--manifest", str(manifest),
+        ], catch_exceptions=False)
+        # Next scan: new maintainer triggers SC-001 (MEDIUM with --no-github).
+        _route_pypi({PYPI_JSON_URL.format(package="requests"):
+                     _doc_with_new_maintainer("2.32.0")})
+
+        # Without --skip, SC-001 appears.
+        r = runner.invoke(cli, [
+            "--baseline-db", str(baseline_db),
+            "scan", "deps", "--manifest", str(manifest),
+            "--output", "json", "--output-file", str(out),
+            "--no-github", "--no-cross-ecosystem",
+        ], catch_exceptions=False)
+        assert r.exit_code == 0
+        ids = {f["check_id"] for f in json.loads(out.read_text())["findings"]}
+        assert "SC-001" in ids
+
+        # With --skip SC-001, the finding is suppressed.
+        r = runner.invoke(cli, [
+            "--baseline-db", str(baseline_db),
+            "scan", "deps", "--manifest", str(manifest),
+            "--output", "json", "--output-file", str(out),
+            "--no-github", "--no-cross-ecosystem",
+            "--skip", "SC-001",
+        ], catch_exceptions=False)
+        assert r.exit_code == 0
+        ids = {f["check_id"] for f in json.loads(out.read_text())["findings"]}
+        assert "SC-001" not in ids
+    finally:
+        _pypi.set_fetcher(None)
+        _npm.set_fetcher(None)
+
+
+def test_cli_skip_unknown_id_errors(tmp_path: Path) -> None:
+    runner, manifest, baseline_db = _install_runner(tmp_path)
+    try:
+        r = runner.invoke(cli, [
+            "--baseline-db", str(baseline_db),
+            "scan", "deps", "--manifest", str(manifest),
+            "--no-github", "--no-cross-ecosystem",
+            "--skip", "SC-999",
+        ], catch_exceptions=False)
+        assert r.exit_code == 2
+        assert "SC-999" in r.output
+        assert "unknown check ID" in r.output
+    finally:
+        _pypi.set_fetcher(None)
+        _npm.set_fetcher(None)
+
+
+# ── Usability: suppression file ─────────────────────────────────────
+
+
+def test_cli_suppression_file_silences_findings(tmp_path: Path) -> None:
+    runner, manifest, baseline_db = _install_runner(tmp_path)
+    out = tmp_path / "findings.json"
+    ignore = tmp_path / "ignore.json"
+    ignore.write_text(json.dumps({
+        "suppressions": [
+            {"check_id": "SC-001", "reason": "known ownership reshuffle 2026-04"},
+        ],
+    }), encoding="utf-8")
+    try:
+        runner.invoke(cli, [
+            "--baseline-db", str(baseline_db),
+            "baseline", "init", "--manifest", str(manifest),
+        ], catch_exceptions=False)
+        _route_pypi({PYPI_JSON_URL.format(package="requests"): _doc_with_new_maintainer("2.32.0")})
+
+        r = runner.invoke(cli, [
+            "--baseline-db", str(baseline_db),
+            "scan", "deps", "--manifest", str(manifest),
+            "--output", "json", "--output-file", str(out),
+            "--no-github", "--no-cross-ecosystem",
+            "--ignore-file", str(ignore),
+            "--fail-on", "MEDIUM",
+        ], catch_exceptions=False)
+        # SC-001 suppressed → MEDIUM gate passes.
+        assert r.exit_code == 0
+        ids = {f["check_id"] for f in json.loads(out.read_text())["findings"]}
+        assert "SC-001" not in ids
+    finally:
+        _pypi.set_fetcher(None)
+        _npm.set_fetcher(None)
+
+
+def test_cli_suppression_missing_reason_errors(tmp_path: Path) -> None:
+    runner, manifest, baseline_db = _install_runner(tmp_path)
+    ignore = tmp_path / "ignore.json"
+    ignore.write_text(json.dumps({
+        "suppressions": [{"check_id": "SC-001"}],  # missing reason
+    }), encoding="utf-8")
+    try:
+        runner.invoke(cli, [
+            "--baseline-db", str(baseline_db),
+            "baseline", "init", "--manifest", str(manifest),
+        ], catch_exceptions=False)
+        r = runner.invoke(cli, [
+            "--baseline-db", str(baseline_db),
+            "scan", "deps", "--manifest", str(manifest),
+            "--no-github", "--no-cross-ecosystem",
+            "--ignore-file", str(ignore),
+        ], catch_exceptions=False)
+        assert r.exit_code == 2
+        assert "'reason' is required" in r.output
+    finally:
+        _pypi.set_fetcher(None)
+        _npm.set_fetcher(None)
+
+
+def test_cli_no_ignore_bypasses_suppression_file(tmp_path: Path) -> None:
+    runner, manifest, baseline_db = _install_runner(tmp_path)
+    out = tmp_path / "findings.json"
+    # Place ignore.json in the default location (next to baseline_db).
+    ignore = baseline_db.parent / "ignore.json"
+    ignore.write_text(json.dumps({
+        "suppressions": [{"check_id": "SC-001", "reason": "default policy"}],
+    }), encoding="utf-8")
+    try:
+        runner.invoke(cli, [
+            "--baseline-db", str(baseline_db),
+            "baseline", "init", "--manifest", str(manifest),
+        ], catch_exceptions=False)
+        _route_pypi({PYPI_JSON_URL.format(package="requests"): _doc_with_new_maintainer("2.32.0")})
+
+        runner.invoke(cli, [
+            "--baseline-db", str(baseline_db),
+            "scan", "deps", "--manifest", str(manifest),
+            "--output", "json", "--output-file", str(out),
+            "--no-github", "--no-cross-ecosystem",
+            "--no-ignore",
+        ], catch_exceptions=False)
+        # Default policy bypassed → SC-001 survives.
+        ids = {f["check_id"] for f in json.loads(out.read_text())["findings"]}
+        assert "SC-001" in ids
+    finally:
+        _pypi.set_fetcher(None)
+        _npm.set_fetcher(None)
+
+
+# ── Usability: SARIF output ─────────────────────────────────────────
+
+
+def test_cli_sarif_output_has_correct_shape(tmp_path: Path) -> None:
+    runner, manifest, baseline_db = _install_runner(tmp_path)
+    out = tmp_path / "findings.sarif"
+    try:
+        runner.invoke(cli, [
+            "--baseline-db", str(baseline_db),
+            "baseline", "init", "--manifest", str(manifest),
+        ], catch_exceptions=False)
+        _route_pypi({PYPI_JSON_URL.format(package="requests"): _doc_with_new_maintainer("2.32.0")})
+
+        r = runner.invoke(cli, [
+            "--baseline-db", str(baseline_db),
+            "scan", "deps", "--manifest", str(manifest),
+            "--output", "sarif", "--output-file", str(out),
+            "--no-github", "--no-cross-ecosystem",
+        ], catch_exceptions=False)
+        assert r.exit_code == 0
+        payload = json.loads(out.read_text(encoding="utf-8"))
+        assert payload["version"] == "2.1.0"
+        assert payload["runs"][0]["tool"]["driver"]["name"] == "pipeline-watch"
+        rule_ids = {r["id"] for r in payload["runs"][0]["tool"]["driver"]["rules"]}
+        assert "SC-001" in rule_ids
+        # Result level reflects SC-001 MEDIUM (no-github) → warning.
+        results = payload["runs"][0]["results"]
+        sc001 = next(r for r in results if r["ruleId"] == "SC-001")
+        assert sc001["level"] == "warning"
+        assert sc001["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] == str(manifest)
+    finally:
+        _pypi.set_fetcher(None)
+        _npm.set_fetcher(None)
+
+
+# ── Usability: baseline diff ────────────────────────────────────────
+
+
+def test_cli_baseline_diff_shows_version_change(tmp_path: Path) -> None:
+    runner, manifest, baseline_db = _install_runner(tmp_path)
+    try:
+        runner.invoke(cli, [
+            "--baseline-db", str(baseline_db),
+            "baseline", "init", "--manifest", str(manifest),
+        ], catch_exceptions=False)
+        # Registry now advertises a newer version.
+        _route_pypi({PYPI_JSON_URL.format(package="requests"): _pypi_doc(version="2.32.0")})
+
+        r = runner.invoke(cli, [
+            "--baseline-db", str(baseline_db),
+            "baseline", "diff", "--manifest", str(manifest),
+        ], catch_exceptions=False)
+        assert r.exit_code == 0
+        # Both old and new version should appear in the diff rendering.
+        assert "2.31.0" in r.output
+        assert "2.32.0" in r.output
+    finally:
+        _pypi.set_fetcher(None)
+        _npm.set_fetcher(None)
+
+
+def test_cli_baseline_diff_reports_no_changes(tmp_path: Path) -> None:
+    runner, manifest, baseline_db = _install_runner(tmp_path)
+    try:
+        runner.invoke(cli, [
+            "--baseline-db", str(baseline_db),
+            "baseline", "init", "--manifest", str(manifest),
+        ], catch_exceptions=False)
+        r = runner.invoke(cli, [
+            "--baseline-db", str(baseline_db),
+            "baseline", "diff", "--manifest", str(manifest),
+        ], catch_exceptions=False)
+        assert r.exit_code == 0
+        assert "No differences" in r.output
+    finally:
+        _pypi.set_fetcher(None)
+        _npm.set_fetcher(None)
+
+
+# ── Usability: --baseline-update flag ───────────────────────────────
+
+
+def test_cli_scan_keeps_prior_snapshot_by_default(tmp_path: Path) -> None:
+    """Without --baseline-update a finding re-flags on the next run."""
+    runner, manifest, baseline_db = _install_runner(tmp_path)
+    out = tmp_path / "findings.json"
+    try:
+        runner.invoke(cli, [
+            "--baseline-db", str(baseline_db),
+            "baseline", "init", "--manifest", str(manifest),
+        ], catch_exceptions=False)
+        _route_pypi({PYPI_JSON_URL.format(package="requests"): _doc_with_new_maintainer("2.32.0")})
+
+        for _ in range(2):
+            r = runner.invoke(cli, [
+                "--baseline-db", str(baseline_db),
+                "scan", "deps", "--manifest", str(manifest),
+                "--output", "json", "--output-file", str(out),
+                "--no-github", "--no-cross-ecosystem",
+            ], catch_exceptions=False)
+            assert r.exit_code == 0
+            ids = {f["check_id"] for f in json.loads(out.read_text())["findings"]}
+            assert "SC-001" in ids, (
+                "SC-001 should persist across scans without --baseline-update"
+            )
+    finally:
+        _pypi.set_fetcher(None)
+        _npm.set_fetcher(None)
+
+
+def test_cli_baseline_update_accepts_new_state(tmp_path: Path) -> None:
+    """--baseline-update records the new snapshot → same run next time is clean."""
+    runner, manifest, baseline_db = _install_runner(tmp_path)
+    out = tmp_path / "findings.json"
+    try:
+        runner.invoke(cli, [
+            "--baseline-db", str(baseline_db),
+            "baseline", "init", "--manifest", str(manifest),
+        ], catch_exceptions=False)
+        _route_pypi({PYPI_JSON_URL.format(package="requests"): _doc_with_new_maintainer("2.32.0")})
+
+        r = runner.invoke(cli, [
+            "--baseline-db", str(baseline_db),
+            "scan", "deps", "--manifest", str(manifest),
+            "--output", "json", "--output-file", str(out),
+            "--no-github", "--no-cross-ecosystem",
+            "--baseline-update",
+        ], catch_exceptions=False)
+        assert r.exit_code == 0
+        # Second scan: mallory is now in the baseline, SC-001 quiet.
+        r = runner.invoke(cli, [
+            "--baseline-db", str(baseline_db),
+            "scan", "deps", "--manifest", str(manifest),
+            "--output", "json", "--output-file", str(out),
+            "--no-github", "--no-cross-ecosystem",
+        ], catch_exceptions=False)
+        ids = {f["check_id"] for f in json.loads(out.read_text())["findings"]}
+        assert "SC-001" not in ids
+    finally:
+        _pypi.set_fetcher(None)
+        _npm.set_fetcher(None)
+
+
+def test_cli_skip_changes_gate_result(tmp_path: Path) -> None:
+    """--skip must also remove findings from the gate, not just the report."""
+    runner, manifest, baseline_db = _install_runner(tmp_path)
+    out = tmp_path / "findings.json"
+    try:
+        runner.invoke(cli, [
+            "--baseline-db", str(baseline_db),
+            "baseline", "init", "--manifest", str(manifest),
+        ], catch_exceptions=False)
+        _route_pypi({PYPI_JSON_URL.format(package="requests"):
+                     _doc_with_new_maintainer("2.32.0")})
+
+        # MEDIUM gate without skip: SC-001 fires → gate fails.
+        r = runner.invoke(cli, [
+            "--baseline-db", str(baseline_db),
+            "scan", "deps", "--manifest", str(manifest),
+            "--output", "json", "--output-file", str(out),
+            "--no-github", "--no-cross-ecosystem",
+            "--fail-on", "MEDIUM",
+        ], catch_exceptions=False)
+        assert r.exit_code == 1
+
+        # Same gate with --skip SC-001: passes.
+        r = runner.invoke(cli, [
+            "--baseline-db", str(baseline_db),
+            "scan", "deps", "--manifest", str(manifest),
+            "--output", "json", "--output-file", str(out),
+            "--no-github", "--no-cross-ecosystem",
+            "--fail-on", "MEDIUM",
+            "--skip", "SC-001",
+        ], catch_exceptions=False)
+        assert r.exit_code == 0
+    finally:
+        _pypi.set_fetcher(None)
+        _npm.set_fetcher(None)

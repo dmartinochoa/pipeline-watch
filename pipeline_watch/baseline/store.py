@@ -156,7 +156,7 @@ class PackageSnapshot:
         )
 
     @classmethod
-    def from_row(cls, row: sqlite3.Row | tuple) -> PackageSnapshot:
+    def from_row(cls, row: sqlite3.Row) -> PackageSnapshot:
         def _get(key: str, default: Any = None) -> Any:
             try:
                 return row[key]
@@ -340,6 +340,39 @@ class Store:
             (ecosystem, package),
         ).fetchall()
         return [r["release_hour"] for r in rows]
+
+    def release_weekdays(self, ecosystem: str, package: str) -> list[int]:
+        """Return every observed ``release_weekday`` (non-null) for a package."""
+        rows = self.conn.execute(
+            "SELECT release_weekday FROM package_snapshots "
+            "WHERE ecosystem = ? AND package = ? AND release_weekday IS NOT NULL;",
+            (ecosystem, package),
+        ).fetchall()
+        return [r["release_weekday"] for r in rows]
+
+    def distinct_version_upload_times(
+        self, ecosystem: str, package: str,
+    ) -> list[tuple[str, str]]:
+        """Return distinct ``(version, release_uploaded_at)`` rows.
+
+        Scans append snapshots on every CI run, so the raw table
+        contains duplicates per version. SC-017 needs release timing,
+        not scan timing, so we collapse to one row per version using
+        the earliest-seen upload stamp. Ordered newest upload first.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT version, MIN(release_uploaded_at) AS uploaded_at
+              FROM package_snapshots
+             WHERE ecosystem = ? AND package = ?
+               AND release_uploaded_at IS NOT NULL
+               AND release_uploaded_at != ''
+             GROUP BY version
+             ORDER BY datetime(uploaded_at) DESC;
+            """,
+            (ecosystem, package),
+        ).fetchall()
+        return [(r["version"], r["uploaded_at"]) for r in rows]
 
     # ── Pipeline runs (ci-runtime module — schema only for now) ──────
 

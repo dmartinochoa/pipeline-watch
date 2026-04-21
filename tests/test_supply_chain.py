@@ -12,12 +12,17 @@ from pipeline_watch.detectors.supply_chain import (
     scan,
     signal_constraint_loosened,
     signal_cross_ecosystem,
+    signal_dependency_removed,
     signal_dormant_revival,
     signal_install_script_change,
     signal_maintainer_removed,
+    signal_major_version_jump,
     signal_new_maintainer,
     signal_new_transitive_dep,
     signal_off_hours_release,
+    signal_off_weekday_release,
+    signal_prerelease_as_latest,
+    signal_release_velocity_spike,
     signal_release_without_tag,
     signal_typosquat,
     signal_version_downgrade,
@@ -541,3 +546,218 @@ def test_sc006_uses_stored_manifest_constraint(install_fake_fetcher, store: Stor
     loosened = [ManifestEntry(name="requests", constraint=">=2.31", source_line="requests>=2.31")]
     result = scan(store, loosened, mode="scan", now=NOW + timedelta(days=1))
     assert any(f.check_id == "SC-006" for f in result.findings)
+
+
+# ── SC-013 major-version-jump ───────────────────────────────────────
+
+
+def test_sc013_fires_on_multi_major_jump() -> None:
+    prev = _snap(version="1.4.2")
+    current = _snap(version="4.0.0")
+    findings = signal_major_version_jump(prev, current)
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.check_id == "SC-013"
+    assert f.severity == Severity.MEDIUM
+    assert f.evidence["major_delta"] == 3
+
+
+def test_sc013_skips_single_major_bump() -> None:
+    prev = _snap(version="1.4.2")
+    current = _snap(version="2.0.0")
+    assert signal_major_version_jump(prev, current) == []
+
+
+def test_sc013_skips_patch_release() -> None:
+    prev = _snap(version="2.31.0")
+    current = _snap(version="2.32.1")
+    assert signal_major_version_jump(prev, current) == []
+
+
+def test_sc013_tolerates_v_prefix() -> None:
+    prev = _snap(version="v1.0.0")
+    current = _snap(version="v3.0.0")
+    findings = signal_major_version_jump(prev, current)
+    assert len(findings) == 1
+    assert findings[0].evidence["previous_major"] == 1
+    assert findings[0].evidence["current_major"] == 3
+
+
+def test_sc013_skips_unparseable_version() -> None:
+    prev = _snap(version="unknown")
+    current = _snap(version="4.0.0")
+    assert signal_major_version_jump(prev, current) == []
+
+
+def test_sc013_skipped_without_prior_snapshot() -> None:
+    assert signal_major_version_jump(None, _snap(version="4.0.0")) == []
+
+
+# ── SC-014 dependency-removed ───────────────────────────────────────
+
+
+def test_sc014_fires_when_dependency_disappears() -> None:
+    prev = _snap(dependencies={"urllib3": ">=1.21.1", "certifi": ">=2017.4.17"})
+    current = _snap(dependencies={"urllib3": ">=1.21.1"})
+    findings = signal_dependency_removed(prev, current)
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.check_id == "SC-014"
+    assert f.severity == Severity.LOW
+    assert "certifi" in f.evidence["removed_dependencies"]
+
+
+def test_sc014_skips_when_dependencies_unchanged() -> None:
+    prev = _snap(dependencies={"urllib3": ">=1.21.1"})
+    current = _snap(dependencies={"urllib3": ">=1.21.1"})
+    assert signal_dependency_removed(prev, current) == []
+
+
+def test_sc014_skips_new_dependency_additions() -> None:
+    # Adding is SC-005's job; removal-only means no SC-014 finding.
+    prev = _snap(dependencies={"urllib3": ">=1.21.1"})
+    current = _snap(dependencies={"urllib3": ">=1.21.1", "certifi": ">=2017.4.17"})
+    assert signal_dependency_removed(prev, current) == []
+
+
+def test_sc014_skipped_without_prior_snapshot() -> None:
+    assert signal_dependency_removed(None, _snap()) == []
+
+
+# ── SC-015 off-weekday release ──────────────────────────────────────
+
+
+def test_sc015_fires_on_never_before_weekday() -> None:
+    # Prior releases always Tue (1); current lands on Sat (5).
+    current = _snap(release_weekday=5)
+    findings = signal_off_weekday_release([1, 1, 1, 1, 1], current)
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.check_id == "SC-015"
+    assert f.severity == Severity.LOW
+    assert f.evidence["release_weekday"] == 5
+
+
+def test_sc015_skips_when_weekday_is_historical() -> None:
+    current = _snap(release_weekday=1)
+    assert signal_off_weekday_release([1, 1, 2, 2, 1], current) == []
+
+
+def test_sc015_skips_with_insufficient_history() -> None:
+    current = _snap(release_weekday=5)
+    # Only 3 samples — below the min_samples=5 floor.
+    assert signal_off_weekday_release([1, 1, 1], current) == []
+
+
+def test_sc015_skipped_when_snapshot_missing_weekday() -> None:
+    current = _snap(release_weekday=None)
+    assert signal_off_weekday_release([1, 1, 1, 1, 1], current) == []
+
+
+# ── SC-016 prerelease-as-latest ─────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "version",
+    ["1.0.0-beta", "2.0.0rc1", "0.5.0-alpha.1", "3.0.0.dev2", "1.2.3-nightly"],
+)
+def test_sc016_fires_on_prerelease_marker(version: str) -> None:
+    current = _snap(version=version)
+    findings = signal_prerelease_as_latest(current)
+    assert len(findings) == 1
+    assert findings[0].check_id == "SC-016"
+    assert findings[0].severity == Severity.MEDIUM
+
+
+@pytest.mark.parametrize("version", ["1.0.0", "2.31.0", "v4.5.6", "0.0.1"])
+def test_sc016_skips_stable_versions(version: str) -> None:
+    current = _snap(version=version)
+    assert signal_prerelease_as_latest(current) == []
+
+
+def test_sc016_skips_when_version_missing() -> None:
+    current = _snap(version="")
+    assert signal_prerelease_as_latest(current) == []
+
+
+# ── SC-017 release-velocity-spike ───────────────────────────────────
+
+
+def _iso(dt: datetime) -> str:
+    return dt.isoformat()
+
+
+def test_sc017_fires_on_burst_against_quiet_cadence() -> None:
+    # Prior releases every ~30 days for 6 months, then 3 versions in 12h.
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    history = [
+        ("1.0.0", _iso(base)),
+        ("1.1.0", _iso(base + timedelta(days=30))),
+        ("1.2.0", _iso(base + timedelta(days=60))),
+        ("1.3.0", _iso(base + timedelta(days=90))),
+        ("1.4.0", _iso(base + timedelta(days=120))),
+        # The burst: two sibling versions within 24h of the current.
+        ("2.0.0", _iso(base + timedelta(days=150, hours=2))),
+        ("2.0.1", _iso(base + timedelta(days=150, hours=8))),
+    ]
+    current = _snap(
+        version="2.0.2",
+        release_uploaded_at=_iso(base + timedelta(days=150, hours=12)),
+    )
+    findings = signal_release_velocity_spike(history, current)
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.check_id == "SC-017"
+    assert f.severity == Severity.MEDIUM
+    assert "2.0.2" in f.evidence["versions_in_window"]
+
+
+def test_sc017_skips_packages_that_normally_release_daily() -> None:
+    # A high-cadence package: daily releases. The "burst" is the norm.
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    history = [
+        (f"0.0.{i}", _iso(base + timedelta(days=i)))
+        for i in range(20)
+    ]
+    current = _snap(
+        version="0.0.21",
+        release_uploaded_at=_iso(base + timedelta(days=20, hours=12)),
+    )
+    assert signal_release_velocity_spike(history, current) == []
+
+
+def test_sc017_skipped_with_insufficient_history() -> None:
+    # Only 3 samples — below the 4-sample floor.
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    history = [
+        ("1.0.0", _iso(base)),
+        ("1.1.0", _iso(base + timedelta(hours=1))),
+        ("1.2.0", _iso(base + timedelta(hours=2))),
+    ]
+    current = _snap(
+        version="1.3.0",
+        release_uploaded_at=_iso(base + timedelta(hours=3)),
+    )
+    assert signal_release_velocity_spike(history, current) == []
+
+
+def test_sc017_skipped_when_current_has_no_upload_timestamp() -> None:
+    current = _snap(release_uploaded_at="")
+    assert signal_release_velocity_spike([], current) == []
+
+
+def test_sc017_skipped_when_burst_below_threshold() -> None:
+    # Only 2 versions in the window — threshold is 3.
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    history = [
+        ("1.0.0", _iso(base)),
+        ("1.1.0", _iso(base + timedelta(days=30))),
+        ("1.2.0", _iso(base + timedelta(days=60))),
+        ("1.3.0", _iso(base + timedelta(days=90))),
+        ("2.0.0", _iso(base + timedelta(days=120, hours=6))),
+    ]
+    current = _snap(
+        version="2.0.1",
+        release_uploaded_at=_iso(base + timedelta(days=120, hours=12)),
+    )
+    assert signal_release_velocity_spike(history, current) == []

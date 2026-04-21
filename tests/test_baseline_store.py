@@ -235,3 +235,34 @@ def test_open_creates_parent_dir(tmp_path) -> None:
         assert s.schema_version() == 2
     finally:
         s.close()
+
+
+def test_distinct_version_upload_times_collapses_duplicates(store: Store) -> None:
+    # Two scans of v1.0.0 (different recorded_at, same upload time),
+    # one scan of v1.1.0. Helper should return one row per version.
+    store.record_snapshot(_snap(
+        version="1.0.0",
+        release_uploaded_at="2026-01-01T10:00:00+00:00",
+        recorded_at="2026-01-05T10:00:00+00:00",
+    ))
+    store.record_snapshot(_snap(
+        version="1.0.0",
+        release_uploaded_at="2026-01-01T10:00:00+00:00",
+        recorded_at="2026-01-06T10:00:00+00:00",
+    ))
+    store.record_snapshot(_snap(
+        version="1.1.0",
+        release_uploaded_at="2026-02-01T10:00:00+00:00",
+        recorded_at="2026-02-02T10:00:00+00:00",
+    ))
+    rows = store.distinct_version_upload_times("pypi", "requests")
+    assert [v for v, _ in rows] == ["1.1.0", "1.0.0"]
+
+
+def test_distinct_version_upload_times_skips_blank_stamps(store: Store) -> None:
+    store.record_snapshot(_snap(version="1.0.0", release_uploaded_at=""))
+    store.record_snapshot(_snap(
+        version="1.1.0", release_uploaded_at="2026-02-01T10:00:00+00:00",
+    ))
+    rows = store.distinct_version_upload_times("pypi", "requests")
+    assert [v for v, _ in rows] == ["1.1.0"]

@@ -35,10 +35,16 @@ from . import __version__
 from .baseline.store import Store, default_baseline_path
 from .detectors import supply_chain as _supply
 from .output.formatter import report_json, report_terminal
-from .output.schema import Severity, score_from_findings
+from .output.sarif import to_sarif
+from .output.schema import Severity, score_from_findings, severity_rank
 from .providers import github as _github
 from .providers import npm as _npm
 from .providers import pypi as _pypi
+from .suppressions import (
+    apply_suppressions,
+    default_suppression_path,
+    load_suppressions,
+)
 
 
 def _tolerate_unencodable_stdio() -> None:
@@ -50,9 +56,12 @@ def _tolerate_unencodable_stdio() -> None:
     crashing the CLI before it emits anything useful.
     """
     for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
         try:
-            stream.reconfigure(errors="replace")
-        except (AttributeError, OSError):
+            reconfigure(errors="replace")
+        except OSError:
             pass
 
 
@@ -66,6 +75,47 @@ def _resolve_baseline_path(explicit: str | None) -> Path:
     if explicit:
         return Path(explicit)
     return default_baseline_path()
+
+
+def _infer_ecosystem(manifest: str, explicit: str | None) -> str:
+    """Return the ecosystem for *manifest*.
+
+    Priority: explicit flag > filename heuristic. ``package.json``
+    maps to npm; any filename matching ``requirements*.txt`` maps to
+    pypi. Ambiguous / unknown filenames raise ``click.UsageError``
+    naming the manifest so the operator knows where to look.
+    """
+    if explicit:
+        return explicit.lower()
+    name = Path(manifest).name.lower()
+    if name == "package.json":
+        return "npm"
+    if name.startswith("requirements") and name.endswith(".txt"):
+        return "pypi"
+    raise click.UsageError(
+        f"could not infer --ecosystem from {manifest!r}; "
+        f"pass --ecosystem {{pypi|npm}} explicitly."
+    )
+
+
+def _parse_skip_ids(raw: str | None) -> frozenset[str]:
+    """Normalise and validate a comma-separated list of check IDs.
+
+    Unknown IDs raise ``click.UsageError`` rather than silently passing
+    through — otherwise a typo in CI would quietly re-enable a signal
+    the operator believed was suppressed.
+    """
+    if not raw:
+        return frozenset()
+    requested = {part.strip().upper() for part in raw.split(",") if part.strip()}
+    unknown = requested - set(_supply.SIGNAL_IDS)
+    if unknown:
+        known = ", ".join(sorted(_supply.SIGNAL_IDS))
+        raise click.UsageError(
+            f"--skip referenced unknown check ID(s): "
+            f"{', '.join(sorted(unknown))}. Known: {known}"
+        )
+    return frozenset(requested)
 
 
 def _github_probe_factory(enable: bool):
@@ -161,19 +211,20 @@ def baseline() -> None:
               help="Path to the dependency manifest (requirements.txt or package.json).")
 @click.option("--ecosystem",
               type=click.Choice(["pypi", "npm"], case_sensitive=False),
-              default="pypi", show_default=True,
-              help="Package ecosystem of the manifest.")
+              default=None,
+              help="Package ecosystem. Inferred from the manifest filename "
+                   "when unset (requirements*.txt → pypi, package.json → npm).")
 @click.pass_context
-def baseline_init(ctx: click.Context, manifest: str, ecosystem: str) -> None:
+def baseline_init(ctx: click.Context, manifest: str, ecosystem: str | None) -> None:
     """Populate the baseline from a manifest without emitting findings.
 
     Run this once per project before scanning — establishes what
     "normal" looks like for every listed package. Later ``scan deps``
     invocations compare against these snapshots.
     """
-    ecosystem = ecosystem.lower()
     if not os.path.isfile(manifest):
         raise click.UsageError(f"--manifest file not found: {manifest}")
+    ecosystem = _infer_ecosystem(manifest, ecosystem)
 
     debug = _debug_factory(ctx.obj["verbose"], ctx.obj["quiet"])
     try:
@@ -274,6 +325,124 @@ def _render_snapshot(console: Console, snap) -> None:
     console.print(table)
 
 
+@baseline.command("diff")
+@click.option("--manifest", required=True, metavar="PATH",
+              help="Path to the dependency manifest to compare against the baseline.")
+@click.option("--ecosystem",
+              type=click.Choice(["pypi", "npm"], case_sensitive=False),
+              default=None,
+              help="Package ecosystem. Inferred from the manifest filename "
+                   "when unset.")
+@click.pass_context
+def baseline_diff(
+    ctx: click.Context, manifest: str, ecosystem: str | None,
+) -> None:
+    """Dry-run: show what changed between the registry and the baseline.
+
+    Unlike ``scan deps``, diff writes nothing, emits no findings, and
+    never fails the gate. Use it when preparing a re-baseline PR to
+    preview the side effects before running ``scan --baseline-update``.
+    """
+    if not os.path.isfile(manifest):
+        raise click.UsageError(f"--manifest file not found: {manifest}")
+    ecosystem = _infer_ecosystem(manifest, ecosystem)
+
+    try:
+        entries = _supply.parse_manifest(manifest, ecosystem)
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
+
+    path = ctx.obj["baseline_db"]
+    console = Console()
+    changes = 0
+    now_iso = _utc_now_iso()
+
+    with Store.open(path) as store:
+        for entry in entries:
+            _, current = _supply._fetch_current_snapshot(
+                ecosystem, entry, now_iso=now_iso,
+            )
+            if current is None:
+                console.print(
+                    f"[yellow]?[/yellow] {entry.name}: not found on "
+                    f"{ecosystem} (skipping).",
+                )
+                continue
+            prev = store.latest_snapshot(ecosystem, entry.name)
+            diffs = _snapshot_diff(prev, current)
+            if not diffs:
+                continue
+            changes += 1
+            console.print(_render_diff(entry.name, prev, current, diffs))
+
+    if changes == 0:
+        console.print("[green]No differences between baseline and registry.[/green]")
+
+
+def _utc_now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _snapshot_diff(prev, current) -> list[tuple[str, str, str]]:
+    """Return ``(field, prev_repr, current_repr)`` for fields that changed.
+
+    ``prev`` may be ``None`` (new package). We diff only the
+    security-relevant columns — noise like ``recorded_at`` always
+    differs and adds nothing.
+    """
+    def _fmt_maintainers(snap) -> str:
+        if snap is None:
+            return "(none)"
+        return ", ".join(m.get("name", "") for m in snap.maintainers) or "(none)"
+
+    def _fmt_deps(snap) -> str:
+        if snap is None:
+            return "(none)"
+        return ", ".join(f"{k}{v}" for k, v in snap.dependencies.items()) or "(none)"
+
+    def _get(snap, attr, default="-"):
+        return default if snap is None else getattr(snap, attr) or default
+
+    fields = [
+        ("version", _get(prev, "version", "(new)"), current.version),
+        (
+            "install_script_hash",
+            _get(prev, "install_script_hash", "-"),
+            current.install_script_hash or "-",
+        ),
+        ("maintainers", _fmt_maintainers(prev), _fmt_maintainers(current)),
+        ("dependencies", _fmt_deps(prev), _fmt_deps(current)),
+        (
+            "release_uploaded_at",
+            _get(prev, "release_uploaded_at", "-"),
+            current.release_uploaded_at or "-",
+        ),
+        (
+            "yanked_or_deprecated",
+            "True" if prev and prev.yanked else "False",
+            "True" if current.yanked else "False",
+        ),
+    ]
+    return [(k, a, b) for k, a, b in fields if a != b]
+
+
+def _render_diff(
+    package: str, prev, current, diffs: list[tuple[str, str, str]],
+) -> Table:
+    label = "[cyan]NEW[/cyan]" if prev is None else "[yellow]CHANGED[/yellow]"
+    table = Table(
+        title=f"{label} {package} @ {current.version}",
+        box=box.SIMPLE_HEAD,
+    )
+    table.add_column("Field", style="bold")
+    table.add_column("Baseline", style="dim")
+    table.add_column("Current")
+    for field_name, before, after in diffs:
+        table.add_row(field_name, before, after)
+    return table
+
+
 @baseline.command("reset")
 @click.option("--scope", required=True, metavar="SCOPE",
               help="Scope to reset: 'package:NAME', 'job:REPO:JOB', or 'org:NAME'.")
@@ -318,6 +487,62 @@ def baseline_stats(ctx: click.Context) -> None:
     console.print(table)
 
 
+# ── signals ─────────────────────────────────────────────────────────
+
+
+_SEVERITY_STYLE = {
+    Severity.CRITICAL: "bold red",
+    Severity.HIGH: "red",
+    Severity.MEDIUM: "yellow",
+    Severity.LOW: "cyan",
+}
+
+
+@cli.command("signals")
+@click.option("--output", "-o",
+              type=click.Choice(["terminal", "json"], case_sensitive=False),
+              default="terminal", show_default=True,
+              help="Output format for the signal listing.")
+def signals(output: str) -> None:
+    """List every implemented check (SC-XXX) with its severity and description.
+
+    The list is driven by the detector's own catalogue, so ``signals``
+    stays accurate even when the README drifts. Useful for discovering
+    valid IDs to pass to ``scan deps --skip``.
+    """
+    catalogue = _supply.SIGNAL_CATALOGUE
+    if output == "json":
+        import json
+        payload = {
+            "schema_version": "1.0",
+            "signals": [
+                {"id": sc_id, "slug": slug, "severity": sev.value, "description": desc}
+                for sc_id, (slug, sev, desc) in catalogue.items()
+            ],
+        }
+        click.echo(json.dumps(payload, indent=2))
+        return
+
+    console = Console()
+    table = Table(
+        title=f"pipeline-watch signals ({len(catalogue)} checks)",
+        box=box.SIMPLE_HEAD,
+    )
+    table.add_column("ID", style="bold", no_wrap=True)
+    table.add_column("Severity", no_wrap=True)
+    table.add_column("Slug", style="dim")
+    table.add_column("Description")
+    for sc_id, (slug, sev, desc) in catalogue.items():
+        style = _SEVERITY_STYLE[sev]
+        table.add_row(
+            sc_id,
+            f"[{style}]{sev.value}[/{style}]",
+            slug,
+            desc,
+        )
+    console.print(table)
+
+
 # ── scan <subcommand> ───────────────────────────────────────────────
 
 
@@ -331,13 +556,16 @@ def scan() -> None:
               help="Path to the dependency manifest (requirements.txt or package.json).")
 @click.option("--ecosystem",
               type=click.Choice(["pypi", "npm"], case_sensitive=False),
-              default="pypi", show_default=True)
+              default=None,
+              help="Package ecosystem. Inferred from the manifest filename "
+                   "when unset (requirements*.txt → pypi, package.json → npm).")
 @click.option("--output", "-o",
-              type=click.Choice(["terminal", "json", "both"], case_sensitive=False),
+              type=click.Choice(["terminal", "json", "sarif", "both"], case_sensitive=False),
               default="terminal", show_default=True,
-              help="Output format.")
+              help="Output format. 'sarif' emits SARIF 2.1.0 for GitHub "
+                   "Code Scanning / Azure DevOps.")
 @click.option("--output-file", "-O", metavar="PATH", default=None,
-              help="Write the JSON report to this path. Implies --output json when unset.")
+              help="Write the structured report to this path. Format tracks --output.")
 @click.option("--fail-on",
               type=click.Choice(["CRITICAL", "HIGH", "MEDIUM", "LOW"], case_sensitive=False),
               default="HIGH", show_default=True,
@@ -346,11 +574,26 @@ def scan() -> None:
               help="Skip GitHub API calls — SC-001/SC-003 confidence drops to MEDIUM.")
 @click.option("--no-cross-ecosystem", is_flag=True, default=False,
               help="Skip cross-ecosystem lookups — disables SC-008.")
+@click.option("--skip", "skip_ids", metavar="IDS", default=None,
+              help="Comma-separated check IDs to suppress from the report "
+                   "and from the gate (e.g. 'SC-005,SC-014'). Unknown IDs error.")
+@click.option("--baseline-update", is_flag=True, default=False,
+              help="Accept the current state as the new normal. Without "
+                   "this flag, packages with findings keep their prior "
+                   "snapshot so the same deviation re-flags next run.")
+@click.option("--ignore-file", metavar="PATH", default=None,
+              help="Path to a suppression file. Defaults to "
+                   "<baseline-dir>/ignore.json; missing files are silently skipped.")
+@click.option("--no-ignore", is_flag=True, default=False,
+              help="Do not load any suppression file for this run.")
 @click.pass_context
 def scan_deps(
-    ctx: click.Context, manifest: str, ecosystem: str,
+    ctx: click.Context, manifest: str, ecosystem: str | None,
     output: str, output_file: str | None,
     fail_on: str, no_github: bool, no_cross_ecosystem: bool,
+    skip_ids: str | None,
+    baseline_update: bool,
+    ignore_file: str | None, no_ignore: bool,
 ) -> None:
     """Scan a dependency manifest against the baseline.
 
@@ -358,9 +601,10 @@ def scan_deps(
     starting point. Subsequent runs diff the registry's current view
     against the stored snapshot and emit findings.
     """
-    ecosystem = ecosystem.lower()
     if not os.path.isfile(manifest):
         raise click.UsageError(f"--manifest file not found: {manifest}")
+    ecosystem = _infer_ecosystem(manifest, ecosystem)
+    skip = _parse_skip_ids(skip_ids)
 
     debug = _debug_factory(ctx.obj["verbose"], ctx.obj["quiet"])
     try:
@@ -399,7 +643,7 @@ def scan_deps(
                 store, entries, ecosystem=ecosystem,
                 github_probe=github_probe,
                 npm_probe=npm_probe, pypi_probe=pypi_probe,
-                mode=mode,
+                mode=mode, update_baseline=baseline_update,
             )
     except Exception as exc:  # noqa: BLE001
         import traceback
@@ -414,32 +658,95 @@ def scan_deps(
             f"{', '.join(result.packages_missing_from_registry)}",
             err=True,
         )
+    if result.packages_skipped_due_to_findings and not ctx.obj["quiet"]:
+        click.echo(
+            f"[scan] baseline NOT updated for "
+            f"{len(result.packages_skipped_due_to_findings)} package(s) with "
+            f"findings: {', '.join(result.packages_skipped_due_to_findings)}. "
+            f"Re-run with --baseline-update once reviewed.",
+            err=True,
+        )
 
-    score = score_from_findings(result.findings)
+    findings = result.findings
+    if skip:
+        before = len(findings)
+        findings = [f for f in findings if f.check_id not in skip]
+        suppressed = before - len(findings)
+        if suppressed and not ctx.obj["quiet"]:
+            click.echo(
+                f"[scan] suppressed {suppressed} finding(s) via --skip "
+                f"({', '.join(sorted(skip))}).",
+                err=True,
+            )
 
-    # Output — terminal goes to stdout unless JSON is also being produced,
-    # in which case the terminal goes to stderr so stdout stays parseable.
-    json_text = report_json(
-        result.findings, tool_version=__version__, module="supply-chain",
-    )
+    # Suppression file — applied after --skip so both CI-level flags
+    # and project-committed policy stack.
+    suppressed_by_file: list = []
+    if not no_ignore:
+        ignore_path = (
+            Path(ignore_file) if ignore_file
+            else default_suppression_path(path)
+        )
+        try:
+            loaded = load_suppressions(ignore_path)
+        except ValueError as exc:
+            raise click.UsageError(str(exc)) from exc
+        for w in loaded.warnings:
+            if not ctx.obj["quiet"]:
+                click.echo(f"[scan] {w}", err=True)
+        if loaded.suppressions:
+            findings, suppressed_by_file = apply_suppressions(
+                findings, loaded.suppressions,
+            )
+            if suppressed_by_file and not ctx.obj["quiet"]:
+                click.echo(
+                    f"[scan] suppressed {len(suppressed_by_file)} finding(s) "
+                    f"via {ignore_path}.",
+                    err=True,
+                )
+                if ctx.obj["verbose"]:
+                    for f, rule in suppressed_by_file:
+                        click.echo(
+                            f"[debug]   {f.check_id} on "
+                            f"{f.evidence.get('package', '?')}: "
+                            f"{rule.reason}",
+                            err=True,
+                        )
+
+    score = score_from_findings(findings)
+
+    # Output — terminal goes to stdout unless structured output is also being
+    # produced, in which case the terminal goes to stderr so stdout stays parseable.
+    is_structured = output in ("json", "sarif", "both")
+    structured_text = ""
+    if output == "sarif" or (output_file and output == "sarif"):
+        structured_text = to_sarif(
+            findings, tool_version=__version__, manifest=manifest,
+        )
+    elif is_structured or output_file:
+        structured_text = report_json(
+            findings, tool_version=__version__, module="supply-chain",
+        )
 
     if output in ("terminal", "both") and not ctx.obj["quiet"]:
         stderr_console = output == "both"
         console = Console(stderr=stderr_console)
-        report_terminal(result.findings, score, console=console)
-    if output in ("json", "both") or output_file:
+        report_terminal(findings, score, console=console)
+    if is_structured or output_file:
         if output_file:
-            Path(output_file).write_text(json_text, encoding="utf-8")
+            Path(output_file).write_text(structured_text, encoding="utf-8")
             if not ctx.obj["quiet"]:
-                click.echo(f"[scan] JSON report written to {output_file}", err=True)
-        elif output in ("json", "both"):
-            click.echo(json_text)
+                fmt = "SARIF" if output == "sarif" else "JSON"
+                click.echo(
+                    f"[scan] {fmt} report written to {output_file}", err=True,
+                )
+        elif is_structured:
+            click.echo(structured_text)
 
     # Gate — exit 1 when any finding meets or exceeds --fail-on severity.
     threshold = Severity(fail_on.upper())
-    from .output.schema import severity_rank
     th_rank = severity_rank(threshold)
-    gating = [f for f in result.findings if severity_rank(f.severity) >= th_rank]
+    gating = [f for f in findings if severity_rank(f.severity) >= th_rank]
     if gating:
         if not ctx.obj["quiet"]:
             click.echo(
@@ -450,7 +757,7 @@ def scan_deps(
         sys.exit(1)
     if not ctx.obj["quiet"]:
         click.echo(
-            f"[gate] PASS — {len(result.findings)} finding(s), grade {score['grade']}.",
+            f"[gate] PASS — {len(findings)} finding(s), grade {score['grade']}.",
             err=True,
         )
 
@@ -459,16 +766,18 @@ def scan_deps(
 @click.option("--manifest", required=True, metavar="PATH")
 @click.option("--ecosystem",
               type=click.Choice(["pypi", "npm"], case_sensitive=False),
-              default="pypi", show_default=True)
+              default=None)
 @click.option("--output-file", "-O", default="findings.json", show_default=True,
               metavar="PATH")
 @click.option("--fail-on",
               type=click.Choice(["CRITICAL", "HIGH", "MEDIUM", "LOW"], case_sensitive=False),
               default="HIGH", show_default=True)
+@click.option("--skip", "skip_ids", metavar="IDS", default=None,
+              help="Comma-separated check IDs to suppress (see 'scan deps --help').")
 @click.pass_context
 def scan_all(
-    ctx: click.Context, manifest: str, ecosystem: str,
-    output_file: str, fail_on: str,
+    ctx: click.Context, manifest: str, ecosystem: str | None,
+    output_file: str, fail_on: str, skip_ids: str | None,
 ) -> None:
     """Run every implemented module and write a consolidated report.
 
@@ -485,6 +794,10 @@ def scan_all(
         fail_on=fail_on,
         no_github=False,
         no_cross_ecosystem=False,
+        skip_ids=skip_ids,
+        baseline_update=False,
+        ignore_file=None,
+        no_ignore=False,
     )
 
 
